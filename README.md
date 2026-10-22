@@ -32,6 +32,39 @@ team: please report problems with it here, not to them.
 Back to the official ReSkate: put its own `ReSkate.dll` and `ReSkateLauncher.exe` (its Releases) back.
 This launcher never updates itself or `ReSkate.dll` (`DINGOSDK_LAUNCHER_AUTO_UPDATE=OFF`).
 
+## How to use
+
+**1. Find the items.** Open the wardrobe → the **Accessories** tab (carabiner icon). At the top there are tabs
+**All / Lanyards / Keychains / Chains**: switch them with **LT / RT** (gamepad) or **Z / C** (keyboard). Put an item on
+like any other clothing.
+
+**2. Open the customizer.** Highlight a lanyard, keychain or wallet chain and press **R3** (gamepad) or **V**
+(keyboard). A panel opens next to your skater.
+
+- Go up / down the list: **D-pad** or **arrow keys**
+- Change the value: **D-pad left / right** or **arrow keys**
+- Close: **B** or **Esc**
+
+The skater turns to show the item; turn him yourself with the right stick. Every change shows right away and is saved.
+
+**3. What's in the panel**
+
+- **Strap**: with the braided strap, or only the carabiner clipped on the belt loop
+- **Charm 1 / 2 / 3**: a charm for each slot (the same charm can't hang twice)
+- **Carabiner color**: its own look, colours or chameleon
+- **Strap color**: 30 colours: leathers, camo, metals and more
+- **Sound**: keys jingle on / off
+- **Place**: back, front or side, left or right
+- **Up / down, Off the leg, To the side, Turn, Tilt**: fine-tune where it hangs
+- **Only for these pants**: keep this position only for the pants you wear now
+- **Back to the mod's place**: undo the fine-tuning (**A** / **Enter**)
+
+Carabiner keychains have everything. Chain keychains: everything except the charms and the strap colour. Lanyards:
+place and fine-tuning. Wallet chains: place.
+
+**Updating ReSkate:** this build comes with its own `ReSkate.dll` and launcher. When a new ReSkate version comes out
+and you update to it, these files get replaced and the customizer stops working: wait for this build's update first.
+
 ## Building this build
 
 As in [Building from source](#building-from-source) below, configured with
