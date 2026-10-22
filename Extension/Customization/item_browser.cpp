@@ -1,5 +1,6 @@
 #include "item_browser.h"
 #include "item_origins.h"
+#include "accessory_probe.h"
 #include "Engine/Core/Platform/path_text.h"
 #include "local_customization_runtime.h"
 #include "Engine/Core/Json/json.h"
@@ -18,11 +19,14 @@
 #include <atomic>
 #include <charconv>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
 #include <span>
+#include <thread>
 #include <utility>
 
 namespace dingosdk::item_browser {
@@ -140,6 +144,14 @@ struct Grid {
     std::vector<std::uint64_t> shown;    // item models of the rows the game's list has now
     int focused{-1};                     // row in `shown`
     bool failed{};
+    std::string_view kind;               // the type tab picked (one of kind_names), empty: all
+    std::vector<KindCount> kinds;        // the type tabs its items make, from the last sync
+    Slot slot{};                         // what its items are, from the last list the game built
+    // A grid keeps its focused tile after its screen has gone, so a focused tile alone does not say the
+    // grid is on screen. The game moves the focus only in the grid that is: the newest move tells.
+    ULONGLONG focus_moved{};             // when the game last moved the focus in it (to it, or to another tile)
+    ULONGLONG unfocused_for{};           // the move after which its focus mark was taken off, as stale
+    ULONGLONG last_shown{};              // when it last was the grid the overlay was for
 };
 
 struct State {
@@ -176,6 +188,7 @@ struct Shared {
     std::vector<std::string> pokes;
     std::atomic<unsigned> toggles{}, cycles{};
     std::atomic<int> filter{-1};
+    std::atomic<int> kind_steps{}, kind_pick{-1}; // type tabs: steps right (left when negative), a tab picked
     std::atomic<bool> status{};
 };
 Shared& shared() { static auto* value = new Shared; return *value; }
@@ -236,6 +249,8 @@ Item resolve(const md::Context& context, std::uint64_t content) {
     item.key = md::string(md::read<md::Address>(at + context.member(data.type, data_key).offset), 255);
     item.title = md::string(md::read<md::Address>(at + context.member(data.type, data_title).offset), 255);
     item.category = md::string(md::read<md::Address>(at + context.member(data.type, data_category).offset), 96);
+    if (const auto& known = profile_runtime::cosmetic_runtime().items; !item.key.empty())
+        if (const auto found = known.find(item.key); found != known.end()) item.shape = found->second.shape;
     const auto& catalogs = content_cache::catalogs();
     item.modded = catalogs.available && !catalogs.items.contains(folded(item.key));
     return item;
@@ -351,14 +366,298 @@ std::vector<std::byte> take_rows(const std::vector<std::byte>& from, const std::
     return out;
 }
 
+// The research log of what the grids did is kept short: a session's first lines tell enough.
+bool budget(unsigned& left) {
+    if (!left) return false;
+    --left;
+    return true;
+}
+
+// The game changed the rows of a grid while a search, filter or type tab hid some of them. When those
+// rows are only what was shown (keep_hidden), the game sorted or made again our shorter list: the hidden
+// rows are put back beside the game's, so the grid does not lose them until the next level. False: the
+// rows are the game's own whole list.
+bool restore_hidden(State& s, const md::Context& context, Grid& grid, const Rows& rows, std::vector<Item>& items) {
+    const auto merged = keep_hidden(grid.native, grid.shown, items);
+    if (merged.empty()) return false;
+    unsigned count{}, stride{};
+    const auto backing = context.array(context.field(grid.backing, owned_items), 4096, count, stride);
+    md::require(count == grid.native.size() && stride == s.layout.stride, "Item grid copy differs.");
+    std::map<std::string_view, std::string_view> kinds_by_key; // the kinds the whole list gave its items
+    for (const auto& item : grid.native) if (!item.key.empty()) kinds_by_key.emplace(item.key, item.kind);
+    std::vector<Item> native;
+    std::vector<std::byte> bytes;
+    native.reserve(merged.size());
+    bytes.reserve(merged.size() * stride);
+    unsigned kept = 0, gone = 0;
+    for (const auto& row : merged) {
+        const std::byte* at{};
+        Item item;
+        if (row.from_game) {
+            item = items[row.index];
+            if (const auto found = kinds_by_key.find(item.key); found != kinds_by_key.end()) item.kind = found->second;
+            at = rows.bytes.data() + std::size_t{row.index} * stride;
+        } else {
+            item = grid.native[row.index];
+            // A hidden tile whose model went with the ones the game made again cannot be shown any more.
+            if (!item.key.empty() && resolve(context, item.content).key != item.key) { ++gone; continue; }
+            if (!item.key.empty()) ++kept;
+            at = backing.data() + std::size_t{row.index} * stride;
+        }
+        native.push_back(std::move(item));
+        bytes.insert(bytes.end(), at, at + stride);
+    }
+    static unsigned lines = 40;
+    if (budget(lines))
+        logging::log(Level::info, Channel::customization,
+            "Item browser: the game remade the {} row(s) shown of a grid of slot {} ({} items); {} hidden item(s) put back{}.",
+            rows.count, static_cast<int>(grid.slot), grid.native.size(), kept,
+            gone ? ", " + std::to_string(gone) + " gone with the game's old tiles" : std::string{});
+    if (!kept) return false;
+    context.array(context.field(grid.backing, owned_items), bytes, static_cast<unsigned>(native.size()));
+    grid.native = std::move(native);
+    grid.shown = rows.content;
+    return true;
+}
+
+// Takes the focus mark off the tiles of grids the focus has left: once the game has moved the focus in
+// another grid, theirs is what their screen had when it went. Coming back to such a grid then shows as a
+// move again, whichever tile the game puts the focus on.
+void unmark_stale_focus(const md::Context& context, std::vector<Grid>& grids) {
+    const Grid* newest = nullptr;
+    for (const auto& grid : grids)
+        if (grid.focused >= 0 && (!newest || grid.focus_moved > newest->focus_moved)) newest = &grid;
+    if (!newest || !newest->focus_moved) return;
+    for (auto& grid : grids) {
+        if (&grid == newest || grid.focused < 0 || grid.focus_moved >= newest->focus_moved ||
+            grid.unfocused_for == newest->focus_moved || static_cast<std::size_t>(grid.focused) >= grid.shown.size()) continue;
+        grid.unfocused_for = newest->focus_moved; // once: if the game keeps the mark, it is left alone
+        try {
+            const auto row = context.element(grid.items, static_cast<unsigned>(grid.focused));
+            context.set(context.path(row, {focused_path[0], focused_path[1], focused_path[2], focused_path[3], focused_path[4]}),
+                        std::uint8_t{0});
+        } catch (const std::exception&) {}
+    }
+}
+
+std::string hex(std::uint64_t value, int width);
+// fit21 research: which of the game's models names the item a grid FOCUSED (see patch_fit21.py). A few probes a
+// session, only for grids of our accessories; read only.
+void probe_focus(const md::Context& context, std::uint64_t content) {
+    static unsigned left = 12;
+    if (!left || !content) return;
+    const auto item = resolve(context, content);
+    if (item.key.empty() || !accessory_variant(item.key)) return;
+    --left;
+    const auto started = GetTickCount64();
+    std::uint64_t data{}, view_at{}, data_at{};
+    try {
+        const md::Value view{content, context.type_of(content)};
+        view_at = context.address(view);
+        data = md::read<md::Ref>(view_at + context.member(view.type, ownable_data_ref).offset).handle & ~std::uint64_t{1};
+        if (data) data_at = context.address(md::Value{data, context.type_of(data)});
+    } catch (...) {}
+    // fit25: what a value names, if it is one of them
+    const auto names = [&](std::uint64_t v) -> const char* {
+        if (!v) return nullptr;
+        const auto h = v & ~std::uint64_t{1};
+        if (h == content) return " -> the tile's item model";
+        if (h == data) return " -> its catalog item";
+        if (v == view_at) return " -> the tile's item model (address)";
+        if (v == data_at) return " -> its catalog item (address)";
+        return nullptr;
+    };
+    std::string found;
+    unsigned roots_n = 0, fields_n = 0, hits = 0;
+    std::set<std::uint64_t> seen;
+    std::function<void(md::Address, md::Address, const std::string&, int)> walk =
+        [&](md::Address type, md::Address at, const std::string& path, int depth) {
+        if (fields_n > 3000000 || hits > 40) return;
+        const auto meta = md::read<md::Address>(type), fields = md::read<md::Address>(meta + 0x60);
+        const auto count = md::read<std::uint16_t>(meta + 0x2a);
+        for (unsigned i = 0; i < count && i < 256; ++i) {
+            const auto entry = fields + i * 24;
+            const auto hash = md::read<std::uint32_t>(entry);
+            const auto ftype = md::read<md::Address>(entry + 16);
+            const auto offset = md::read<std::uint16_t>(entry + 8);
+            ++fields_n;
+            if (!ftype) continue;
+            const auto kind = md::kind(ftype);
+            const auto here = path + "." + hex(hash, 8);
+            const auto fsize = md::size(ftype);
+            if (fsize == 8 && kind != 7) {
+                if (const auto* what = names(md::read<std::uint64_t>(at + offset)))
+                    ++hits, found += "\n    " + here + " (8 bytes, schema " + hex(schema_of(ftype), 8) + ")" + what;
+                continue;
+            }
+            if (fsize == sizeof(md::Ref)) {
+                // any 16-byte value: a DataModelReference or another typed reference (UIOwnableDataRef's own kind)
+                const auto ref = md::read<md::Ref>(at + offset);
+                if (const auto* what = names(ref.handle)) {
+                    ++hits, found += "\n    " + here + " (schema " + hex(schema_of(ftype), 8) + ")" + what;
+                    continue;
+                }
+            }
+            if (schema_of(ftype) == reference && fsize == sizeof(md::Ref)) {
+                const auto h = md::read<md::Ref>(at + offset).handle & ~std::uint64_t{1};
+                if (h && depth < 3 && seen.insert(h).second) {
+                    try {
+                        const md::Value next{h, context.type_of(h)};
+                        if (next.type && md::kind(next.type) == 2) walk(next.type, context.address(next), here + ">", depth + 1);
+                    } catch (...) {}
+                }
+            } else if (kind == 7) {
+                try {
+                    if (md::string(md::read<md::Address>(at + offset), 96) == item.key) ++hits, found += "\n    " + here + " = its key";
+                } catch (...) {}
+            } else if (kind == 2 && depth < 4) {
+                walk(ftype, at + offset, here, depth + 1);
+            }
+        }
+    };
+    for (const auto& root : context.roots()) {
+        ++roots_n;
+        if (schema_of(root.model.type) == grid_list.hash) continue; // the grids' own rows name it, of course
+        if (!seen.insert(root.model.handle).second) continue;
+        try { walk(root.model.type, context.address(root.model), hex(schema_of(root.model.type), 8) + "@" + hex(root.model.handle, 12), 0); }
+        catch (...) {}
+    }
+    logging::log(Level::info, Channel::customization,
+        "Item browser: focus probe on {} (tile item model {}, catalog item {}): {} roots, {} fields, {} ms{}", item.key,
+        hex(content, 12), hex(data, 12), roots_n, fields_n, GetTickCount64() - started,
+        found.empty() ? std::string(" - nothing refers to them") : found);
+}
+
+// fit28 research: the game's "focused item" is in no data model (fit25): the heap. After the focus moves onto one of
+// our tiles, a background scan lists the 8-byte slots holding that tile's item model / catalog item (handle, handle | 1,
+// native address); every later scan keeps only the slots that now hold the NEW tile's, by kind. Read only.
+namespace focus_scan {
+struct Want { std::uint64_t value{}; std::uint8_t kind{}; };
+struct Hit { std::uintptr_t at{}; std::uint8_t kind{}; };
+constexpr const char* kind_names[]{"item model", "item model|1", "catalog item", "catalog item|1", "item model address",
+                                   "catalog item address"};
+constexpr std::size_t most = 1u << 20;
+struct Shared {
+    std::mutex lock;
+    std::atomic<bool> busy{};
+    std::atomic<std::uint64_t> serial{};   // focus moves seen
+    std::vector<Hit> kept;
+    unsigned rounds{};
+};
+Shared& shared() { static auto* value = new Shared; return *value; }
+std::uint64_t scan_range(const std::uint8_t* p, std::size_t n, std::uintptr_t start, const Want* want, std::size_t wants,
+                         const std::uint8_t* first, Hit* out, std::size_t& count) noexcept {
+    __try {
+        for (std::size_t i = 0; i + 8 <= n; i += 8) {
+            const auto v = *reinterpret_cast<const std::uint64_t*>(p + i);
+            if (!first[v & 0xffff]) continue;
+            for (std::size_t k = 0; k < wants; ++k)
+                if (v == want[k].value) {
+                    if (count < most) out[count++] = {start + i, want[k].kind};
+                    break;
+                }
+        }
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 1; }
+}
+void run(std::vector<Want> want, std::string key, std::uint64_t serial) {
+    auto& s = shared();
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    const auto began = GetTickCount64();
+    std::vector<std::uint8_t> first(65536);
+    for (const auto& w : want) first[w.value & 0xffff] = 1;
+    std::vector<Hit> hits(most);
+    std::size_t count{};
+    std::uint64_t faults{}, bytes{};
+    MEMORY_BASIC_INFORMATION info{};
+    for (std::uintptr_t at = 0x10000; at < memory::highest_user_address;) {
+        if (!VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info))) break;
+        const auto start = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+        const auto size = static_cast<std::size_t>(info.RegionSize);
+        at = start + size;
+        if (info.State != MEM_COMMIT || (info.Type != MEM_PRIVATE && info.Type != MEM_IMAGE) ||
+            (info.Protect & (PAGE_GUARD | PAGE_NOACCESS | PAGE_NOCACHE | PAGE_WRITECOMBINE)))
+            continue;
+        const DWORD kind = info.Protect & 0xff;
+        if (kind != PAGE_READWRITE && kind != PAGE_EXECUTE_READWRITE && kind != PAGE_WRITECOPY) continue;
+        faults += scan_range(reinterpret_cast<const std::uint8_t*>(start), size, start, want.data(), want.size(), first.data(),
+                             hits.data(), count);
+        bytes += size;
+    }
+    hits.resize(count);
+    std::string line;
+    {
+        std::lock_guard guard(s.lock);
+        if (s.serial.load() != serial) {
+            line = std::format("Item browser: focus scan on {} discarded (the focus moved during it)", key);
+        } else {
+            if (!s.rounds++) {
+                s.kept = hits;
+            } else {
+                std::vector<Hit> next;
+                std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) { return a.at < b.at; });
+                for (const auto& k : s.kept) {
+                    const auto it = std::lower_bound(hits.begin(), hits.end(), k.at, [](const Hit& h, std::uintptr_t a) { return h.at < a; });
+                    if (it != hits.end() && it->at == k.at && it->kind == k.kind) next.push_back(k);
+                }
+                s.kept = std::move(next);
+            }
+            line = std::format("Item browser: focus scan {} on {}: {} slot(s) hold it, {} kept since the first scan; {:.1f} GB, {} ms, {} fault(s)",
+                               s.rounds, key, count, s.kept.size(), static_cast<double>(bytes) / (1u << 30), GetTickCount64() - began, faults);
+            if (s.rounds > 1 && s.kept.size() <= 40)
+                for (const auto& k : s.kept) {
+                    std::uint64_t before{}, value{}, after{};
+                    (void)memory::peek(k.at - 8, before), (void)memory::peek(k.at, value), (void)memory::peek(k.at + 8, after);
+                    MEMORY_BASIC_INFORMATION where{};
+                    VirtualQuery(reinterpret_cast<void*>(k.at), &where, sizeof(where));
+                    line += std::format("\n    {:#x} ({}; region {:#x} +{:#x}, {}) = {:#x} [{:#x} | {:#x}]", k.at, kind_names[k.kind],
+                                        reinterpret_cast<std::uintptr_t>(where.AllocationBase),
+                                        k.at - reinterpret_cast<std::uintptr_t>(where.AllocationBase),
+                                        where.Type == MEM_IMAGE ? "image" : "heap", value, before, after);
+                }
+        }
+    }
+    logging::log(Level::info, Channel::customization, "{}", line);
+    s.busy.store(false);
+}
+// The focus moved onto `content` (one of our tiles): a scan, when none is running. Client thread.
+void focused(const md::Context& context, std::uint64_t content, const std::string& key) {
+    auto& s = shared();
+    const auto serial = s.serial.fetch_add(1) + 1;
+    if (s.rounds >= 8 || s.busy.exchange(true)) return;
+    try {
+        const md::Value view{content, context.type_of(content)};
+        const auto view_at = context.address(view);
+        const auto data = md::read<md::Ref>(view_at + context.member(view.type, ownable_data_ref).offset).handle & ~std::uint64_t{1};
+        const auto data_at = data ? context.address(md::Value{data, context.type_of(data)}) : 0;
+        std::vector<Want> want{{content, 0}, {content | 1, 1}, {data, 2}, {data | 1, 3}, {view_at, 4}, {data_at, 5}};
+        std::erase_if(want, [](const Want& w) { return w.value < 0x10000; });
+        std::thread(run, std::move(want), key, serial).detach();
+    } catch (...) {
+        s.busy.store(false);
+    }
+}
+} // namespace focus_scan
+
 void sync(State& s, const md::Context& context, Grid& grid, bool verify) {
     if (grid.failed) return;
     grid.items = context.field(grid.list, owned_items);
     auto rows = read_rows(context, grid.items, s.layout);
+    if (rows.focused >= 0 && rows.focused != grid.focused) {
+        grid.focus_moved = GetTickCount64();
+        if (grid.focused >= 0) try { probe_focus(context, rows.content[static_cast<std::size_t>(rows.focused)]); } catch (...) {}
+        // fit28: the heap scan for the game's focused item (our tiles only)
+        try {
+            const auto content = rows.content[static_cast<std::size_t>(rows.focused)];
+            if (const auto item = resolve(context, content); !item.key.empty() && accessory_variant(item.key))
+                focus_scan::focused(context, content, item.key);
+        } catch (...) {}
+    }
     grid.focused = rows.focused;
     if (rows.content != grid.shown || verify) {
         // Not what we last put there: the game built the list again (the screen opened, an item was
-        // equipped, mods changed). Its list is complete and in its own order, so it is the new source.
+        // equipped, mods changed). Its list is complete and in its own order, so it is the new source --
+        // unless it only sorted or remade the shorter list it was shown (restore_hidden).
         std::vector<Item> items;
         items.reserve(rows.count);
         for (const auto content : rows.content) items.push_back(resolve(context, content));
@@ -371,7 +670,32 @@ void sync(State& s, const md::Context& context, Grid& grid, bool verify) {
                 ours = known != grid.native.end() && known->key == items[i].key;
             }
         }
-        if (!ours) {
+        if (!ours) assign_kinds(items);
+        if (!ours && !restore_hidden(s, context, grid, rows, items)) {
+            // A whole list shorter than the one it replaces: worth knowing when a grid seems to lose items.
+            static unsigned shorter_lines = 40;
+            if (!grid.native.empty() && items.size() < grid.native.size() && budget(shorter_lines))
+                logging::log(Level::info, Channel::customization, "Item browser: a grid of slot {} now has {} rows ({} before).",
+                    static_cast<int>(grid.slot), items.size(), grid.native.size());
+            grid.slot = grid_slot(items);
+            // Once per grid as built: how its items were sorted, and what was left as "Other" (for the rules).
+            static std::map<std::pair<int, std::size_t>, bool> logged;
+            if (const auto slot = static_cast<int>(grid.slot); slot && !logged[{slot, items.size()}]) {
+                logged[{slot, items.size()}] = true;
+                std::map<std::string_view, unsigned> counts;
+                std::string others;
+                unsigned shaped = 0, listed = 0;
+                for (const auto& item : items) {
+                    if (item.key.empty()) continue;
+                    ++counts[item.kind];
+                    shaped += !item.shape.empty();
+                    if (item.kind == "Other" && listed++ < 40) others += "\n    " + item.key + " | " + item.title + " | " + item.shape;
+                }
+                std::string line;
+                for (const auto& [kind, count] : counts) line += " " + std::string(kind) + " " + std::to_string(count) + ",";
+                logging::log(Level::info, Channel::customization, "Item browser: grid of slot {} ({} items, {} with a shape):{}{}",
+                    slot, items.size(), shaped, line, others);
+            }
             if (!grid.backing.handle)
                 grid.backing = context.create(grid_list, (GetTickCount64() << 12) | (++s.serial & 0xfff));
             context.array(context.field(grid.backing, owned_items), rows.bytes, rows.count);
@@ -379,7 +703,18 @@ void sync(State& s, const md::Context& context, Grid& grid, bool verify) {
             grid.shown = rows.content;
         }
     }
-    const auto order = arrange(grid.native, s.favorites.keys, s.search, s.filter);
+    const auto picks = accessory_probe::model_picks();
+    grid.kinds = kinds(grid.native, s.favorites.keys, s.search, s.filter, &picks);
+    // Public build (forestmouse, 2026-10-22): type tabs only over the accessories (Lanyards / Keychains / Chains);
+    // every other grid stays as ReSkate shows it
+    if (std::none_of(grid.kinds.begin(), grid.kinds.end(), [](const KindCount& k) {
+            return k.name == "Lanyards" || k.name == "Keychains" || k.name == "Chains";
+        }))
+        grid.kinds.clear();
+    // A list built again for another slot has other kinds: its tabs start from "all".
+    if (!grid.kind.empty() && std::none_of(grid.kinds.begin(), grid.kinds.end(), [&](const KindCount& k) { return k.name == grid.kind; }))
+        grid.kind = {};
+    const auto order = arrange(grid.native, s.favorites.keys, s.search, s.filter, grid.kind, &picks);
     std::vector<std::uint64_t> wanted;
     wanted.reserve(order.size());
     for (const auto index : order) wanted.push_back(grid.native[index].content);
@@ -498,6 +833,25 @@ std::string poke(State& s, const md::Context& context, const std::string& argume
     return out;
 }
 
+// The type tabs: "all", then the grid's kinds. A step skips the tabs the search and the filter leave
+// empty, and goes round from the last to the first.
+void step_kind(Grid& grid, int steps, int pick) {
+    if (grid.kinds.size() < 2) return;
+    const auto tabs = static_cast<int>(grid.kinds.size()) + 1;
+    int tab = 0;
+    for (int i = 0; i < tabs - 1; ++i) if (grid.kinds[static_cast<std::size_t>(i)].name == grid.kind) tab = i + 1;
+    const auto usable = [&](int t) { return t == 0 || grid.kinds[static_cast<std::size_t>(t - 1)].shown > 0; };
+    if (pick >= 0 && pick < tabs && usable(pick)) tab = pick;
+    for (int left = std::abs(steps); left > 0; --left) {
+        const int way = steps > 0 ? 1 : -1;
+        do tab = (tab + way + tabs) % tabs; while (!usable(tab));
+    }
+    const std::string_view kind = tab ? grid.kinds[static_cast<std::size_t>(tab - 1)].name : std::string_view{};
+    if (kind == grid.kind) return;
+    grid.kind = kind;
+    logging::log(Level::info, Channel::customization, "Item browser: type tab {}.", kind.empty() ? std::string_view("All") : kind);
+}
+
 // Research aid, with the status: every grid list the game has open, taken or not, and what its
 // first tiles show. Says why a menu's grid was passed over.
 void log_roots(State& s, const md::Context& context) {
@@ -531,9 +885,15 @@ void log_status(const State& s) {
         if (grid.focused >= 0 && static_cast<std::size_t>(grid.focused) < grid.shown.size())
             for (const auto& item : grid.native)
                 if (item.content == grid.shown[static_cast<std::size_t>(grid.focused)]) focus = std::to_string(grid.focused) + " " + item.key;
-        logging::log(Level::info, Channel::customization, "  grid {}: {} of {} shown, first \"{}\", focus {}{}.",
-            hex(grid.list.handle, 16), grid.shown.size(), grid.native.size(),
-            grid.native.empty() ? std::string{} : grid.native.front().title, focus, grid.failed ? ", FAILED" : "");
+        std::string tabs;
+        for (const auto& kind : grid.kinds) tabs += " " + std::string(kind.name) + " " + std::to_string(kind.total);
+        const auto now = GetTickCount64();
+        logging::log(Level::info, Channel::customization,
+            "  grid {} (slot {}): {} of {} shown, first \"{}\", focus {} (moved {} ms ago, on screen {} ms ago){}; type {}, tabs:{}.",
+            hex(grid.list.handle, 16), static_cast<int>(grid.slot), grid.shown.size(), grid.native.size(),
+            grid.native.empty() ? std::string{} : grid.native.front().title, focus,
+            grid.focus_moved ? now - grid.focus_moved : 0, grid.last_shown ? now - grid.last_shown : 0, grid.failed ? ", FAILED" : "",
+            grid.kind.empty() ? std::string_view("All") : grid.kind, tabs);
     }
 }
 } // namespace
@@ -562,6 +922,10 @@ const overlay::ItemBrowserHost* overlay_host() noexcept {
             out.shown = current.shown;
             out.total = current.total;
             out.focused_favorite = current.focused_favorite;
+            out.focused_key = current.focused_key;
+            out.focused_index = current.focused_index;
+            out.focused_shows = current.focused_shows;
+            out.rows = current.rows;
             // The mod the highlighted item is from, for its card (item_origins.h).
             if (const auto origin = current.focused_key.empty() ? nullptr : item_origins::find(current.focused_key)) {
                 out.mod_title = origin->title;
@@ -571,13 +935,19 @@ const overlay::ItemBrowserHost* overlay_host() noexcept {
                 out.mod_items = static_cast<unsigned>(origin->items);
                 out.mod_changed = item_origins::game_item(current.focused_key);
             }
+            for (const auto& tab : current.tabs) out.tabs.push_back({std::string(tab.name), tab.shown, tab.total});
+            out.tab = current.tab;
             return out;
         },
         [] { toggle_focused_favorite(); },
         [](const char* text) { set_search(text ? text : ""); },
-        [] { cycle_filter(); }};
+        [] { cycle_filter(); },
+        [](int steps) { step_tab(steps); },
+        [](unsigned tab) { pick_tab(tab); }};
     return &host;
 }
+void step_tab(int steps) noexcept { shared().kind_steps.fetch_add(steps); }
+void pick_tab(unsigned tab) noexcept { shared().kind_pick.store(static_cast<int>(tab)); }
 void cycle_filter() noexcept { shared().cycles.fetch_add(1); }
 void request_status() noexcept { shared().status.store(true); }
 void request_poke(std::string arguments) {
@@ -672,10 +1042,22 @@ void follow_focus(State& s, Shared& sh, std::uintptr_t base) {
         if (rows.focused < 0 || static_cast<std::size_t>(rows.focused) >= rows.content.size()) return;
         const auto content = rows.content[static_cast<std::size_t>(rows.focused)];
         const auto item = std::find_if(grid->native.begin(), grid->native.end(), [&](const Item& i) { return i.content == content; });
-        if (item == grid->native.end() || item->key == next.focused_key) return;
+        if (item == grid->native.end()) return;
+        if (item->key == next.focused_key) {
+            // the same tile: what it shows can still have changed (an accessory tile pointed at another pick)
+            auto shows = resolve(context, content).key;
+            if (shows == next.focused_shows) return;
+            next.focused_shows = std::move(shows);
+            std::lock_guard shared_lock(sh.mutex);
+            sh.view = std::move(next);
+            return;
+        }
         next.focused_title = item->title;
         next.focused_key = item->key;
         next.focused_favorite = s.favorites.keys.contains(item->key);
+        next.focused_index = rows.focused;
+        next.rows = rows.count;
+        next.focused_shows = resolve(context, content).key;
     }
     std::lock_guard shared_lock(sh.mutex);
     sh.view = std::move(next);
@@ -725,21 +1107,28 @@ void update(std::uintptr_t base) noexcept {
             s.filter = static_cast<Filter>(filter);
         for (auto cycles = sh.cycles.exchange(0); cycles; --cycles)
             s.filter = static_cast<Filter>((static_cast<unsigned>(s.filter) + 1) % std::size(filter_names));
-        const Grid* active = nullptr;
+        Grid* active = nullptr;
         const Item* focused = nullptr;
+        // The grid on screen: of those with a focused tile, the one the game last moved the focus in.
+        // (The first one found used to be taken, and that could be a grid of a screen that had gone, which
+        // kept its focused tile: the overlay was for it, without tabs, while the grid on screen stayed on
+        // a type tab no key could change until the next level.)
         const auto find_focus = [&] {
             active = nullptr; focused = nullptr;
-            for (const auto& grid : s.grids) {
+            for (auto& grid : s.grids) {
                 if (grid.focused < 0 || static_cast<std::size_t>(grid.focused) >= grid.shown.size()) continue;
-                // Its screen closed: gone at the next scan, but no longer what the player is in now.
+                // Its screen closed: gone at the next scan, but no longer what the player is in now (upstream
+                // 2.1.0), and of the rest the grid the game last moved the focus in (ours, tabs4).
                 if (context.type_of(grid.list.handle) != grid.list.type) continue;
-                active = &grid;
-                for (const auto& item : grid.native)
-                    if (item.content == grid.shown[static_cast<std::size_t>(grid.focused)]) focused = &item;
-                break;
+                if (!active || grid.focus_moved > active->focus_moved) active = &grid;
             }
+            if (active)
+                for (const auto& item : active->native)
+                    if (item.content == active->shown[static_cast<std::size_t>(active->focused)]) focused = &item;
         };
         find_focus();
+        if (const auto steps = sh.kind_steps.exchange(0), pick = sh.kind_pick.exchange(-1); active && (steps || pick >= 0))
+            step_kind(*active, steps, pick);
         if (const auto toggles = sh.toggles.exchange(0); (toggles & 1) && focused && !focused->key.empty()) {
             const auto key = focused->key;
             if (!s.favorites.keys.erase(key)) s.favorites.keys.insert(key);
@@ -754,6 +1143,7 @@ void update(std::uintptr_t base) noexcept {
                 if (rescan || (grid.focused >= 0 && s.tick % 3 == 0)) mark(s, context, grid);
             } catch (const std::exception& error) { report(s, error.what()); }
         }
+        unmark_stale_focus(context, s.grids);
         find_focus();
         for (const auto& arguments : pokes) {
             try { logging::log(Level::info, Channel::customization, "Item browser: {}", poke(s, context, arguments)); }
@@ -769,13 +1159,34 @@ void update(std::uintptr_t base) noexcept {
         if (!in_menu) menu_since = 0;
         else if (!menu_since) menu_since = now;
         if (!menu_since || now - menu_since < 1000) active = nullptr, focused = nullptr;
-        if (active) s.last_open = now;
+        if (active) s.last_open = now, active->last_shown = now;
         s.open = active != nullptr;
         if (s.open) quiet_notices(s, context);
         s.active_list = active ? active->list.handle : 0;
-        if (!s.open && (s.grids.empty() || now > s.last_open + 8000) && (!s.search.empty() || s.filter != Filter::all)) {
+        // Which grid the overlay is for, when that changes (the first lines of a session, for the log).
+        static std::uint64_t shown_list{};
+        static unsigned shown_lines = 60;
+        if ((active ? active->list.handle : 0) != shown_list) {
+            shown_list = active ? active->list.handle : 0;
+            if (active && budget(shown_lines))
+                logging::log(Level::info, Channel::customization, "Item browser: on screen: grid of slot {} ({} of {} rows, focus {}, type {}).",
+                    static_cast<int>(active->slot), active->shown.size(), active->native.size(), active->focused,
+                    active->kind.empty() ? std::string_view("All") : active->kind);
+        }
+        // A type tab belongs to a grid while it is around: one that has been off screen for as long as
+        // a visit lasts is shown whole again, so a grid can never stay on a tab without its tabs showing.
+        for (auto& grid : s.grids)
+            if (&grid != active && !grid.kind.empty() && now > grid.last_shown + 8000) {
+                logging::log(Level::info, Channel::customization, "Item browser: grid of slot {} off screen, its type tab {} back to All.",
+                    static_cast<int>(grid.slot), grid.kind);
+                grid.kind = {};
+            }
+        if (!s.open && (s.grids.empty() || now > s.last_open + 8000) &&
+            (!s.search.empty() || s.filter != Filter::all ||
+             std::any_of(s.grids.begin(), s.grids.end(), [](const Grid& grid) { return !grid.kind.empty(); }))) {
             s.search.clear();
             s.filter = Filter::all;
+            for (auto& grid : s.grids) grid.kind = {};
         }
         View next;
         next.open = s.open;
@@ -784,13 +1195,26 @@ void update(std::uintptr_t base) noexcept {
         if (active) {
             const auto blanks = leading_blanks(active->native);
             next.shown = static_cast<unsigned>(active->shown.size()) - (std::min)(blanks, static_cast<unsigned>(active->shown.size()));
-            next.total = static_cast<unsigned>(active->native.size()) - blanks;
+            next.total = tile_count(active->native); // fit18: one tile per accessory model
             for (const auto& item : active->native) next.favorites += s.favorites.keys.contains(item.key);
+            // Type tabs only where there is more than one kind to choose from.
+            if (active->kinds.size() >= 2) {
+                KindCount all{"All"};
+                for (const auto& kind : active->kinds) { all.total += kind.total; all.shown += kind.shown; }
+                next.tabs.push_back(all);
+                for (std::size_t i = 0; i < active->kinds.size(); ++i) {
+                    next.tabs.push_back(active->kinds[i]);
+                    if (active->kinds[i].name == active->kind) next.tab = static_cast<unsigned>(i + 1);
+                }
+            }
         }
         if (focused) {
             next.focused_title = focused->title;
             next.focused_key = focused->key;
             next.focused_favorite = s.favorites.keys.contains(focused->key);
+            next.focused_index = active->focused;
+            next.rows = static_cast<unsigned>(active->shown.size());
+            next.focused_shows = resolve(context, focused->content).key;
         }
         std::lock_guard shared_lock(sh.mutex);
         sh.view = std::move(next);

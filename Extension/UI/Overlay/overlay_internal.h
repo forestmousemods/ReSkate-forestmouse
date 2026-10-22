@@ -151,6 +151,9 @@ struct State {
     bool win32_ready = false;
     bool dx12_ready = false;
     std::atomic<bool> freecam_controller_active{false};
+    // The inventory keychain panel holds the game's input (its own flag: the client tick sets the cards' one
+    // every tick, item_browser_overlay.cpp).
+    std::atomic<bool> item_panel_active{false};
     std::atomic<bool> prompt_input_active{false}; // DingoSDKOverlaySetPromptInputCapture
     bool show_on_ready = false;
     bool force_windowed = false;
@@ -327,6 +330,9 @@ void draw_drone_hud();
 // ReSkate's S.K.A.T.E. throwdown HUD (skate_hud_overlay.cpp): polled every presented frame.
 bool skate_hud_pending();
 void draw_skate_hud();
+// Physical Lanyards' lock notice (access_lock_overlay.cpp): over everything, every presented frame while locked.
+bool access_lock_pending();
+void draw_access_lock();
 // ReSkate's nametags (nametag_overlay.cpp): polled every presented frame.
 bool nametags_pending();
 void draw_nametags();
@@ -336,7 +342,18 @@ bool perf_hud_pending();
 void draw_perf_hud();
 void draw_perf_window();
 // The skater item grids' search bar and prompts (item_browser_overlay.cpp): polled every presented frame.
-enum class ItemBrowserKey { favorite, filter };
+enum class ItemBrowserKey { favorite, filter, previous_tab, next_tab };
+// While the type tabs show over a grid: LT and RT step through them, so the game does not get them
+// for the next quarter second (input_capture.cpp).
+void hold_item_browser_triggers() noexcept;
+// The keychain panel: these XInput buttons are kept from the game for 250 ms (each call).
+void hold_item_browser_buttons(std::uint16_t mask) noexcept;
+// fit52: the keychain panel turns the wardrobe skater - the right stick x the game reads (-1..1) for this long, unless
+// the player moves the stick (then item_browser_user_turned_at says when)
+void turn_item_browser_skater(float stick, unsigned milliseconds) noexcept;
+std::uint64_t item_browser_user_turned_at() noexcept;
+// fit19: the game reads these buttons pressed for one short tap (the accessory panel: A equips the focused tile).
+void tap_item_browser_buttons(std::uint16_t bits, unsigned milliseconds = 120) noexcept;
 bool item_browser_pending();
 bool item_browser_open();
 void item_browser_key(ItemBrowserKey key);

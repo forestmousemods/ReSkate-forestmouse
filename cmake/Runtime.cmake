@@ -141,6 +141,7 @@ add_library(dingosdk_runtime SHARED
     Extension/Boot/exit_watch.cpp
     Extension/Boot/discord_presence.cpp
     Extension/Customization/developer_hoodie.cpp
+    Extension/Customization/accessory_probe.cpp
     Extension/Customization/developer_board.cpp
     Extension/Skater/skater_model.cpp
     Extension/Skater/skater_observer.cpp

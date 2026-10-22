@@ -1,3 +1,46 @@
+# ReSkate — forestmouse accessories build
+
+An **unofficial** build of [ReSkate](https://github.com/Dingo-Shenanigans/ReSkate) 2.1.1 with what the
+**Physical Lanyards** mod (lanyards, carabiner keychains with charms, chain keychains and wallet chains with physics)
+needs. Everything else is ReSkate 2.1.1 as its authors made it. This build is not made or supported by the ReSkate
+team: please report problems with it here, not to them.
+
+## What this build adds to ReSkate 2.1.1
+
+- **Keychain configurator.** On a braided carabiner keychain in the Accessories tab press **R3** (gamepad) or **V**
+  (keyboard) -> Customize: where it hangs (back, front or side, left or right, or clipped on the front belt loop),
+  with or without the braided strap, the strap colour, the carabiner colour and up to **3 charms** on the carabiner.
+- **The Accessories wardrobe tab** of Physical Lanyards, merged beside other wardrobe mods such as Skaterize:
+  EBX op lists (`reskate-ops/` in a mod), the skater Lua loader and the CAS slots are combined during the mod merge
+  (`Engine/Resource/EbxOps`, `Engine/Vfs/mod_merge_ops.cpp`, `lua_script_merge.cpp`, `mod_merge_cas_slots.cpp`).
+  Two mods that change the same asset are not left out whole: as in ReSkate 2.1.0, the higher mod's version of each
+  asset wins and only mods that cannot be merged are left out.
+- **Type tabs** (All / Lanyards / Keychains / Chains) over the Accessories grid: LT / RT or Z / C.
+- **The tab's icon on custom maps** (replaced texture chunks are carried into the maps' TOCs).
+- **Room for mods' items in the mesh streaming pool** on the game's own maps (up to 512 MB more, at most half of the
+  free video memory): a heavy worn item left San Vansterdam empty or loading forever.
+- **Launcher:** waits for a Skate.exe still closing from an earlier start (no more "Save is already in use"), and
+  the startup map (`-map`) is loaded once.
+
+## Install
+
+1. Have ReSkate 2.1.1 working (game build 25414733).
+2. Download the release ZIP from this repository's **Releases** and extract it into the Skate folder (the one with
+   `Skate.exe` and `ReSkateLauncher.exe`), replacing the files.
+3. Start `ReSkateLauncher.exe`. **Physical_Lanyards** is in **MODS**; turn it on and play.
+
+Back to the official ReSkate: put its own `ReSkate.dll` and `ReSkateLauncher.exe` (its Releases) back.
+This launcher never updates itself or `ReSkate.dll` (`DINGOSDK_LAUNCHER_AUTO_UPDATE=OFF`).
+
+## Building this build
+
+As in [Building from source](#building-from-source) below, configured with
+`-DDINGOSDK_VERSION=2.1.1 -DDINGOSDK_CRASH_REPORT_URL= -DDINGOSDK_CARGO=OFF -DDINGOSDK_LAUNCHER_AUTO_UPDATE=OFF`.
+
+Licensed like ReSkate under the GNU GPL v3 (see [License](#license)). Physical Lanyards and this build: forestmouse.
+
+---
+
 # ReSkate
 
 play it offline, host your own lobbies and dedicated servers, and mod it.

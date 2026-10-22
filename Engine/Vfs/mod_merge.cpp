@@ -433,6 +433,9 @@ MergeReport merge_mods(const Catalog& catalog, const MergeObserver& observe, con
             for (const auto* mod : mods)
                 if (mod->name == name)
                     for (auto& chunk : chunks) store.shift(chunk.location, chunk.offset, &placements[mod]);
+        for (auto& [guid, replaced] : overrides.replacedChunks)
+            for (const auto* mod : mods)
+                if (mod->name == replaced.mod) store.shift(replaced.chunk.location, replaced.chunk.offset, &placements[mod]);
         lap("asset overrides");
         // The count above missed the root level when only a disabled map brings it, and
         // that is merged too: from here each superbundle is a step, then the layout.

@@ -152,9 +152,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (console_character(message) && s.chat_character_pending.exchange(false)) return 0;
         if (console_character(message) && s.item_search_character_pending.exchange(false)) return 0;
         // The skater item grids (item_browser_overlay.cpp): while one has the focus and nothing of ours
-        // is open, F favorites the highlighted item, X steps the filter and "-" (or Ctrl+F) opens the
-        // search box, which then takes the keys until Enter or Esc. (The game uses Q, E, T and G here:
-        // G opens its feedback card.)
+        // is open, F favorites the highlighted item, X steps the filter, Z and C step the type tabs and
+        // "-" (or Ctrl+F) opens the search box, which then takes the keys until Enter or Esc. (The game
+        // uses Q, E, T and G here: G opens its feedback card.)
         if (s.item_search_visible.load() || s.item_search_escape_pending.load()) {
             if (wp == VK_ESCAPE && (key || release) && !s.console_visible.load() && !s.visible.load()) {
                 if (key && (static_cast<ULONG_PTR>(lp) & (1ull << 30)) == 0) {
@@ -185,6 +185,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             }
             if (!control && wp == 'F') item_browser_key(ItemBrowserKey::favorite);
             if (!control && wp == 'X') item_browser_key(ItemBrowserKey::filter);
+            if (!control && wp == 'Z') item_browser_key(ItemBrowserKey::previous_tab);
+            if (!control && wp == 'C') item_browser_key(ItemBrowserKey::next_tab);
         }
         // T opens the chat, the key the game itself reserves for it
         // (Processor_Keyboard_Gameplay_Chat), while in a session and nothing
@@ -283,7 +285,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }
         const bool capture = owns_pointer();
         const bool freecam_capture = s.freecam_controller_active.load(std::memory_order_relaxed) ||
-                                     s.prompt_input_active.load(std::memory_order_relaxed);
+                                     s.prompt_input_active.load(std::memory_order_relaxed) ||
+                                     s.item_panel_active.load(std::memory_order_relaxed);
         if (freecam_capture) release_game_buttons(window, previous);
         if ((capture || freecam_capture) && is_input(message)) {
             // Foreground raw-input packets still need DefWindowProc cleanup.

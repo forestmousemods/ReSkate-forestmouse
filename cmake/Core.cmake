@@ -76,6 +76,22 @@ add_library(dingosdk_frostbite STATIC
 target_include_directories(dingosdk_frostbite SYSTEM PRIVATE External/bcdec)
 target_link_libraries(dingosdk_frostbite PRIVATE dingosdk_lz4 dingosdk_zstd dingosdk_miniz)
 
+# Our fork: EBX op lists (the ebxtool engine, own_slot_build/ebxtool) applied to another mod's copy of an asset during
+# the mod merge (Engine/Resource/EbxOps/ebx_ops_apply.h). Its copy of the EBX writer keeps ReSkate's own names
+# under other ones, so both writers link.
+add_library(dingosdk_ebx_ops STATIC
+    Engine/Resource/EbxOps/util.cpp
+    Engine/Resource/EbxOps/rawimage.cpp
+    Engine/Resource/EbxOps/ops.cpp
+    Engine/Resource/EbxOps/check.cpp
+    Engine/Resource/EbxOps/ebx_writer_ext.cpp
+    Engine/Resource/EbxOps/ebx_ops_apply.cpp)
+set_source_files_properties(Engine/Resource/EbxOps/ebx_writer_ext.cpp PROPERTIES COMPILE_DEFINITIONS
+    "write_document=ebxops_write_document;ensure_fixup_type=ebxops_ensure_fixup_type")
+target_include_directories(dingosdk_ebx_ops PRIVATE "${PROJECT_SOURCE_DIR}/Engine/Resource" "${PROJECT_SOURCE_DIR}/Engine/Resource/EbxOps")
+target_include_directories(dingosdk_ebx_ops SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/External")
+target_link_libraries(dingosdk_ebx_ops PUBLIC dingosdk_frostbite)
+
 add_library(dingosdk_native_db STATIC Engine/Vfs/native_db.cpp)
 
 if(WIN32)
@@ -104,6 +120,9 @@ if(WIN32)
         Engine/Vfs/mod_merge_overrides.cpp
         Engine/Vfs/mod_merge_conflicts.cpp
         Engine/Vfs/mod_merge_textures.cpp
+        Engine/Vfs/lua_script_merge.cpp
+        Engine/Vfs/mod_merge_cas_slots.cpp
+        Engine/Vfs/mod_merge_ops.cpp
         Engine/Vfs/mod_merge_grid.cpp
         Engine/Vfs/mod_merge_load_screens.cpp
         Engine/Vfs/mod_music.cpp
@@ -111,7 +130,7 @@ if(WIN32)
         Engine/Vfs/mod_store_copies.cpp
         Engine/Vfs/mod_item_sources.cpp
         Engine/Vfs/builtin_packs.cpp)
-    target_link_libraries(dingosdk_mods PUBLIC dingosdk_json dingosdk_mod_list PRIVATE dingosdk_game_archives dingosdk_native_db dingosdk_frostbite dingosdk_content_cache dingosdk_miniz dingosdk_zstd shell32 bcrypt)
+    target_link_libraries(dingosdk_mods PUBLIC dingosdk_json dingosdk_mod_list PRIVATE dingosdk_game_archives dingosdk_native_db dingosdk_frostbite dingosdk_ebx_ops dingosdk_content_cache dingosdk_miniz dingosdk_zstd shell32 bcrypt)
 
     add_library(dingosdk_custom_scripts STATIC Engine/Scripting/custom_scripts.cpp)
     target_link_libraries(dingosdk_custom_scripts PUBLIC dingosdk_json PRIVATE dingosdk_initfs)

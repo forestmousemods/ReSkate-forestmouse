@@ -57,6 +57,8 @@ struct Binding {
     ParameterKey key{};
     Color color{};
     std::uint8_t part{};
+    bool accessory{}; // our fork: in a mod's Accessories slot (CAS_Accessories_Slot), counted as the outfit's part
+    std::uint32_t material_name{}; // our fork (fit34): the material's name hash (material_hash: "Outfit_Bottom_mat" = a strap)
 };
 struct SavedColor {
     Binding binding;
@@ -246,15 +248,9 @@ std::uintptr_t color_parameter(Memory &m, std::uintptr_t base, const ParameterMa
 }
 // All discovery is bounded and follows the actor's own component/controller/material
 // backlinks. Never edit the shared AppearanceShaderExpressionPreset or recipe.
-template<class Read> Materials materials(Read &read, std::uintptr_t base, std::uintptr_t entity) {
+// The items of an appearance component and their colour parameters (out.appearance set).
+template<class Read> void walk_items(multiplayer::CosmeticMemory<Read &> &m, Read &read, std::uintptr_t base, Materials &out) {
     using namespace multiplayer;
-    CosmeticMemory<Read &> m{read, base};
-    Materials out;
-    out.regions_only = true;
-    m.check(m.ptr(entity) == base + addr::engine::skater_entity_vtable, "Skater actor type differs.");
-    out.component = m.component(entity);
-    out.pending = m.template get<std::uint8_t>(out.component, 0x10a) || m.template get<std::uint8_t>(out.component, 0x10d);
-    out.appearance = read_native_component(read, entity, base + addr::engine::skater_appearance_vtable);
     const auto begin = m.ptr(out.appearance, 0x90), end = m.ptr(out.appearance, 0x98), capacity = m.ptr(out.appearance, 0xa0);
     m.check(begin <= end && end <= capacity && (end - begin) % 8 == 0 && (capacity - begin) % 8 == 0 &&
                 (capacity - begin) / 8 <= 64 && (begin || !capacity), "Skater controller array exceeds bounds.");
@@ -263,7 +259,10 @@ template<class Read> Materials materials(Read &read, std::uintptr_t base, std::u
         if (!item || m.ptr(item, 0x48) != out.appearance + 0x40) continue;
         const auto name = m.text(m.ptr(item, 0x30));
         if (!name.starts_with(slot_folder)) continue;
-        const auto slot = std::find(slots.begin(), slots.end(), std::string_view(name).substr(slot_folder.size()));
+        // Our fork: the Accessories slot a mod adds (Physical Lanyards' keychains since 1.4.0) is the outfit's part here.
+        const bool accessory = std::string_view(name).substr(slot_folder.size()) == "CAS_Accessories_Slot";
+        const auto slot = std::find(slots.begin(), slots.end(),
+                                    accessory ? std::string_view("CAS_Outfit_Slot") : std::string_view(name).substr(slot_folder.size()));
         if (slot == slots.end()) continue;
         const auto part = static_cast<std::size_t>(slot - slots.begin());
         // A slot with nothing in it, or with an item still on its way, has no materials.
@@ -291,12 +290,36 @@ template<class Read> Materials materials(Read &read, std::uintptr_t base, std::u
                         ParameterKey native;
                         Color color{};
                         if (const auto parameter = color_parameter(m, base, map, key, native, color))
-                            out.bindings.push_back({item, material, parameter, native, color, static_cast<std::uint8_t>(part)});
+                            out.bindings.push_back({item, material, parameter, native, color, static_cast<std::uint8_t>(part), accessory,
+                                                    m.template get<std::uint32_t>(node)});
                     }
                 }
             }
         }
     }
+}
+template<class Read> Materials materials(Read &read, std::uintptr_t base, std::uintptr_t entity) {
+    using namespace multiplayer;
+    CosmeticMemory<Read &> m{read, base};
+    Materials out;
+    out.regions_only = true;
+    m.check(m.ptr(entity) == base + addr::engine::skater_entity_vtable, "Skater actor type differs.");
+    out.component = m.component(entity);
+    out.pending = m.template get<std::uint8_t>(out.component, 0x10a) || m.template get<std::uint8_t>(out.component, 0x10d);
+    out.appearance = read_native_component(read, entity, base + addr::engine::skater_appearance_vtable);
+    walk_items(m, read, base, out);
+    return out;
+}
+// Our fork (fit30): an appearance component found on its own - the wardrobe's preview character, which is not the
+// local skater entity. Its items' colours, as materials() gives the skater's (no component: never "pending").
+template<class Read> Materials appearance_materials(Read &read, std::uintptr_t base, std::uintptr_t appearance) {
+    using namespace multiplayer;
+    CosmeticMemory<Read &> m{read, base};
+    Materials out;
+    out.regions_only = true;
+    m.check(m.ptr(appearance) == base + addr::engine::skater_appearance_vtable, "Appearance type differs.");
+    out.appearance = appearance;
+    walk_items(m, read, base, out);
     return out;
 }
 inline bool same_binding(const Binding &live, const Binding &saved) noexcept {

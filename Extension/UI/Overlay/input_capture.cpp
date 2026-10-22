@@ -8,6 +8,7 @@
 #include <format>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <mutex>
 #include <set>
@@ -28,10 +29,17 @@ void note_prompt_read(std::atomic<unsigned>& count) {
 PromptReads take_prompt_reads() noexcept {
     return {prompt_xinput.exchange(0), 0, prompt_direct.exchange(0), prompt_hid.exchange(0), prompt_raw.exchange(0)};
 }
+// Only the inventory keychain panel holds the input: the game keeps its right stick (it turns the wardrobe's skater).
+bool panel_hold_only() {
+    const auto& s = state();
+    return s.item_panel_active.load(std::memory_order_relaxed) && !owns_menu_cursor(s) &&
+           !s.freecam_controller_active.load(std::memory_order_relaxed) && !s.prompt_input_active.load(std::memory_order_relaxed);
+}
 bool block_polled_input() {
     const auto error = GetLastError();
     const bool capture = !overlay_input_access && (owns_menu_cursor(state()) || state().freecam_controller_active.load(std::memory_order_relaxed) ||
-                                                    state().prompt_input_active.load(std::memory_order_relaxed));
+                                                    state().prompt_input_active.load(std::memory_order_relaxed) ||
+                                                    state().item_panel_active.load(std::memory_order_relaxed));
     SetLastError(error);
     return capture;
 }
@@ -338,11 +346,15 @@ void filter_pad(bool outer, DWORD user, XINPUT_STATE* output) noexcept {
     g.sThumbRX = pad.right_x;
     g.sThumbRY = pad.right_y;
 }
+// The item browser's holds on a pad the game reads (R3 for the keychain panel, LT / RT for the type tabs).
+void hold_item_browser_pad(XINPUT_GAMEPAD& pad) noexcept;
 // Another program's hook on XInput that was put in front of the capture's own after it was
 // installed (Steam's overlay does, for Steam Input, and answers the game with its own pad
 // without going on to XInput): the capture then never sees the game's reads, and a menu that
 // holds the game's input does not hold its controller. That hook's own function is hooked
 // then, so the capture is in front of it again.
+void tap_item_browser_pad(XINPUT_GAMEPAD& pad, DWORD& packet) noexcept;
+void turn_item_browser_pad(XINPUT_GAMEPAD& pad, DWORD& packet) noexcept;   // fit52
 template<std::size_t I>
 DWORD WINAPI captured_front(DWORD user, XINPUT_STATE* output) {
     const bool capture = block_polled_input();
@@ -354,9 +366,14 @@ DWORD WINAPI captured_front(DWORD user, XINPUT_STATE* output) {
         result = original<DWORD(WINAPI*)(DWORD, XINPUT_STATE*)>(input_hooks().xinput_front[I])(user, output);
     }
     if (result == ERROR_SUCCESS && output && capture) {
+        const auto rx = output->Gamepad.sThumbRX, ry = output->Gamepad.sThumbRY;
         output->Gamepad = {};
+        if (panel_hold_only()) output->Gamepad.sThumbRX = rx, output->Gamepad.sThumbRY = ry;
         output->dwPacketNumber ^= 0x80000000u;
-    } else if (result == ERROR_SUCCESS) {
+        if (outer && panel_hold_only()) turn_item_browser_pad(output->Gamepad, output->dwPacketNumber);   // fit52
+        if (outer) tap_item_browser_pad(output->Gamepad, output->dwPacketNumber);
+    } else if (result == ERROR_SUCCESS && output) {
+        if (outer) hold_item_browser_pad(output->Gamepad), tap_item_browser_pad(output->Gamepad, output->dwPacketNumber);
         filter_pad(outer, user, output);
     }
     return result;
@@ -644,22 +661,73 @@ BOOL WINAPI captured_cursor_position(LPPOINT output) {
     if (result && output && !overlay_input_access) { last = *output; sampled = true; }
     return result;
 }
+// The item grids' type tabs take LT and RT until this tick count (hold_item_browser_triggers).
+std::atomic<std::uint64_t> item_browser_triggers_until{};
+// The keychain panel takes these buttons (R3 opens it) until this tick count (hold_item_browser_buttons).
+std::atomic<std::uint64_t> item_browser_buttons_until{};
+std::atomic<std::uint16_t> item_browser_buttons_mask{};
+// fit19: the accessory panel taps a button for the game (A: equip the tile with the focus) until this tick count,
+// also while the panel holds the game's input.
+std::atomic<std::uint64_t> item_browser_tap_until{};
+std::atomic<std::uint16_t> item_browser_tap_bits{};
+std::atomic<std::uint32_t> item_browser_taps{};
+// fit52: the keychain panel's turn of the wardrobe skater (right stick x) until this tick count; the player's own
+// stick wins (and is noted)
+std::atomic<float> item_browser_turn{};
+std::atomic<std::uint64_t> item_browser_turn_until{}, item_browser_user_turn_at{};
+std::atomic<std::uint32_t> item_browser_turn_version{};
+void turn_item_browser_pad(XINPUT_GAMEPAD& pad, DWORD& packet) noexcept {
+    const auto now = GetTickCount64();
+    packet += item_browser_turn_version.load(std::memory_order_relaxed) << 12;   // a new packet when the turn changes
+    if (std::abs(static_cast<int>(pad.sThumbRX)) > 7000 || std::abs(static_cast<int>(pad.sThumbRY)) > 7000) {
+        item_browser_user_turn_at.store(now, std::memory_order_relaxed);
+        return;
+    }
+    if (now >= item_browser_turn_until.load(std::memory_order_relaxed)) return;
+    pad.sThumbRX = static_cast<SHORT>(std::clamp(item_browser_turn.load(std::memory_order_relaxed), -1.0f, 1.0f) * 32767.0f);
+}
+void tap_item_browser_pad(XINPUT_GAMEPAD& pad, DWORD& packet) noexcept {
+    if (GetTickCount64() >= item_browser_tap_until.load(std::memory_order_relaxed)) return;
+    pad.wButtons |= item_browser_tap_bits.load(std::memory_order_relaxed);
+    packet += item_browser_taps.load(std::memory_order_relaxed) << 20; // a new packet, so the game reads it
+}
+void hold_item_browser_pad(XINPUT_GAMEPAD& pad) noexcept {
+    const auto now = GetTickCount64();
+    if (now < item_browser_buttons_until.load(std::memory_order_relaxed))
+        pad.wButtons &= static_cast<WORD>(~item_browser_buttons_mask.load(std::memory_order_relaxed));
+    if (now < item_browser_triggers_until.load(std::memory_order_relaxed)) pad.bLeftTrigger = pad.bRightTrigger = 0;
+}
 template<std::size_t I, bool Extended = false>
 DWORD WINAPI captured_xinput(DWORD user, XINPUT_STATE* output) {
     const auto& hook = Extended ? input_hooks().xinput_extended[I] : input_hooks().xinput_state[I];
     const bool capture = block_polled_input();
     const bool outer = overlay_input_access == 0;
     note_prompt_read(prompt_xinput);
+    const bool game_read = !overlay_input_access;
     DWORD result;
     { // XInput exports can forward through another hooked XInput export.
         OverlayInputAccess access;
         result = original<DWORD(WINAPI*)(DWORD, XINPUT_STATE*)>(hook)(user, output);
     }
     if (result == ERROR_SUCCESS && output && capture) {
+        const auto rx = output->Gamepad.sThumbRX, ry = output->Gamepad.sThumbRY;
         output->Gamepad = {};
+        if (panel_hold_only()) output->Gamepad.sThumbRX = rx, output->Gamepad.sThumbRY = ry;
         // The game must notice a neutral state even if the physical packet did
         // not change between opening the menu and its next controller poll.
         output->dwPacketNumber ^= 0x80000000u;
+        if (game_read && panel_hold_only()) turn_item_browser_pad(output->Gamepad, output->dwPacketNumber);   // fit52
+        if (game_read) tap_item_browser_pad(output->Gamepad, output->dwPacketNumber);
+    } else if (result == ERROR_SUCCESS && output && game_read) {
+        const auto now = GetTickCount64();
+        tap_item_browser_pad(output->Gamepad, output->dwPacketNumber);
+        if (now < item_browser_buttons_until.load(std::memory_order_relaxed))
+            output->Gamepad.wButtons &= static_cast<WORD>(~item_browser_buttons_mask.load(std::memory_order_relaxed));
+        if (now < item_browser_triggers_until.load(std::memory_order_relaxed)) {
+            output->Gamepad.bLeftTrigger = 0;
+            output->Gamepad.bRightTrigger = 0;
+        }
+        filter_pad(outer, user, output);
     } else if (result == ERROR_SUCCESS) {
         filter_pad(outer, user, output);
     }
@@ -957,4 +1025,24 @@ bool install_input_capture() {
 
 extern "C" void DingoSDKOverlaySetGamepadFilter(dingosdk::overlay::GamepadFilter filter) {
     dingosdk::overlay::detail::gamepad_filter().store(filter, std::memory_order_release);
+}
+
+void dingosdk::overlay::detail::turn_item_browser_skater(float stick, unsigned milliseconds) noexcept {
+    if (item_browser_turn.exchange(stick, std::memory_order_relaxed) != stick) item_browser_turn_version.fetch_add(1, std::memory_order_relaxed);
+    item_browser_turn_until.store(GetTickCount64() + milliseconds, std::memory_order_relaxed);
+}
+std::uint64_t dingosdk::overlay::detail::item_browser_user_turned_at() noexcept {
+    return item_browser_user_turn_at.load(std::memory_order_relaxed);
+}
+void dingosdk::overlay::detail::hold_item_browser_buttons(std::uint16_t mask) noexcept {
+    item_browser_buttons_mask.store(mask, std::memory_order_relaxed);
+    item_browser_buttons_until.store(GetTickCount64() + 250, std::memory_order_relaxed);
+}
+void dingosdk::overlay::detail::tap_item_browser_buttons(std::uint16_t bits, unsigned milliseconds) noexcept {
+    item_browser_tap_bits.store(bits, std::memory_order_relaxed);
+    item_browser_taps.fetch_add(1, std::memory_order_relaxed);
+    item_browser_tap_until.store(GetTickCount64() + milliseconds, std::memory_order_relaxed);
+}
+void dingosdk::overlay::detail::hold_item_browser_triggers() noexcept {
+    item_browser_triggers_until.store(GetTickCount64() + 250, std::memory_order_relaxed);
 }

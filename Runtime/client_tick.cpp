@@ -45,6 +45,7 @@
 #include "Engine/Vfs/mod_list.h"
 #include "Engine/Vfs/mod_merge.h"
 #include "Extension/Skater/ai_skaters.h"
+#include "Extension/Customization/accessory_probe.h"
 #include "Extension/Skater/client_source_spawn.h"
 #include "Extension/Skater/skater_slot_override.h"
 #include "Extension/Skater/drone_flight.h"
@@ -446,6 +447,21 @@ void mesh_pool_for_load(bool custom, std::string_view level) {
         }
     }
     lod_scale::lower(short_of_room, "its meshes need more than the card has room for");
+    // Our fork (2026-10-21): San Van with mods' items. The game's own 520 MB holds the city's meshes; a heavy mod item
+    // worn by the skater (Physical Lanyards' charm keychains, 41 MB each) left the city unstreamed - an empty, black
+    // world after the spawn on a friend's machine and here (RESKATE_MESH_POOL_MB=900 loaded it). The game's own maps get
+    // room beside the game's own size: up to 512 MB more, at most half the video memory free as they load.
+    if (!kb && !custom)
+        if (const auto budget = mesh_pool::budget_of(card)) {
+            constexpr std::uint32_t room_for_mods_kb = 512u * 1024u;
+            const auto current = mesh_pool_wanted_kb ? mesh_pool_wanted_kb : mesh_pool::stock_kb;
+            const auto wanted = (std::min)(mesh_pool::free_kb(*budget, current), mesh_pool::stock_kb + room_for_mods_kb);
+            if (wanted > mesh_pool::stock_kb) {
+                kb = wanted;
+                how = std::format("the game's own map with room for mods' items, {} MB free of a {} MB budget",
+                                  (budget->budget - (std::min)(budget->budget, budget->usage)) >> 20, budget->budget >> 20);
+            }
+        }
     if (!kb) {
         // San Van and the game's other maps: its own, once a custom map has raised it.
         if (!mesh_pool_wanted_kb) return;
@@ -598,6 +614,19 @@ void update_model(std::uintptr_t client, TickState& frame) {
                 }
             }
         }
+        // Our fork (2026-10-20): the startup map is loaded again, once, when the game's own boot flow drops the
+        // player to the splash screen within 2 minutes of it (seen right after a slow profile sign-in: a native
+        // level exit, reason 0xb59c9896, 14 s after the map had loaded).
+        static std::string startup_map;
+        static ULONGLONG startup_map_at{};
+        static bool startup_map_retried{};
+        if (!startup_map.empty() && !startup_map_retried && startup_commands->empty() &&
+            r.menu_splash_ready.load(std::memory_order_relaxed) && GetTickCount64() - startup_map_at < 120000) {
+            startup_map_retried = true;
+            startup_commands->push_back(startup_map);
+            dingosdk::logging::log(dingosdk::logging::Level::warning, dingosdk::logging::Channel::level,
+                "Startup map: the game went back to the splash screen; queued again: {}", startup_map);
+        }
         if (!startup_commands->empty() && named_context_ready) {
             std::lock_guard lock(r.mutex);
             const auto& text = startup_commands->front();
@@ -627,6 +656,7 @@ void update_model(std::uintptr_t client, TickState& frame) {
             if (ready && r.requests.enqueue(ConsoleRequest{text}, request_context(r), GetCurrentThreadId())) {
                 dingosdk::logging::log(dingosdk::logging::Level::info, dingosdk::logging::Channel::level,
                     "Startup command queued: {}", text);
+                if (lower(text).starts_with("load ") && startup_map.empty()) startup_map = text, startup_map_at = GetTickCount64();
                 startup_commands->erase(startup_commands->begin());
             }
         }
@@ -1652,6 +1682,7 @@ void tick(std::uintptr_t client, std::uintptr_t update) {
                 discord_join.clear();
         }
         dingosdk::tick_local_developer_hoodie(r.base, client, multiplayer_ready);
+        dingosdk::accessory_probe::tick(r.base, client, multiplayer_ready);
         dingosdk::tick_local_developer_board(r.base, client, multiplayer_ready);
         // The session spawns and places skaters and can teleport: check the camera again.
         tick_state.camera_issue.reset();

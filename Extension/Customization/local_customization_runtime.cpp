@@ -135,6 +135,21 @@ bool refresh_cosmetic_catalog() {
                 if (info.category.empty()) info.category = name;
                 info.categories.push_back(category_hash);
             }
+            // What it is fitted on, laid out as in the item's EBX: asset +0x28 -> its item data,
+            // +0x98 -> AssetPaths, 16-byte {name, kind} entries; kind 1 a morph preset, 2 a base mesh.
+            // Only the item grids' type tabs use it: an item it cannot be read for just has none.
+            if (std::uintptr_t data{}, paths{}; !info.build_kit && read(asset + 0x28, data) && data && !(data & 7) &&
+                read(data + 0x98, paths) && paths && !(paths & 7)) {
+                std::uint32_t path_count{};
+                if (cosmetic_array(paths, 16, 16, path_count))
+                    for (std::uint32_t i = 0; i < path_count && info.shape.empty(); ++i) {
+                        std::uintptr_t name_ptr{};
+                        std::int32_t kind{};
+                        std::string name;
+                        if (!read(paths + i * 16ULL, name_ptr) || !read(paths + i * 16ULL + 8, kind)) break;
+                        if ((kind == 1 || kind == 2) && name_ptr && cosmetic_text(name_ptr, name)) info.shape = name;
+                    }
+            }
             if (info.build_kit) {
                 const auto start = key.find('_');
                 const auto end = start == std::string::npos ? start : key.find('_', start + 1);
@@ -164,11 +179,17 @@ bool refresh_cosmetic_catalog() {
         std::lock_guard lock(reserved_hash_mutex);
         reserved_hashes = std::move(hashes);
     }
+    std::size_t shaped = 0;
+    std::string examples;
+    for (const auto& [key, info] : items)
+        if (!info.shape.empty() && shaped++ < 4) examples += ' ' + key + '=' + info.shape;
+    dingosdk::logging::log(dingosdk::logging::Level::info, dingosdk::logging::Channel::customization,
+        "Cosmetic shapes: {} of {} items, e.g.{}", shaped, items.size(), examples);
     c.items = std::move(items); c.item_count = count; c.item_manager = manager;
     ++c.items_generation;
     std::ostringstream event;
-    event << "{\"event\":\"local_cosmetic_catalog\",\"installed\":" << items.size() - objects
-          << ",\"objects\":" << objects << '}';
+    event << "{\"event\":\"local_cosmetic_catalog\",\"installed\":" << c.items.size() - objects
+          << ",\"objects\":" << objects << ",\"shapes\":" << shaped << '}';
     dingosdk::logging::event(dingosdk::logging::Channel::customization, event.str().c_str());
     return true;
 }
@@ -212,19 +233,35 @@ bool cosmetic_slot_categories(std::uintptr_t resource, std::map<std::uint32_t, s
     // Tattoos, gestures, stickers and several color/right-side slots share categories.
     std::uintptr_t slots{}; std::uint32_t count{};
     if (!read(resource + 0x28, slots) || !cosmetic_array(slots, 24, 256, count)) return false;
+    // A slot a mod added that cannot be read whole (Skaterize 0.8.0 beside another slot mod, 2026-10-19: every outfit
+    // was refused for one of 56) no longer refuses the outfit: it is logged once and left out, so an item saved in it
+    // shows its slot's default; one whose category cannot be read takes any item (any_slot_category).
+    const auto skip = [&](std::uint32_t index, const std::string& name, const char* what) {
+        static std::set<std::string> told;
+        if (told.size() < 32 && told.insert(std::to_string(index) + name + what).second)
+            dingosdk::logging::log(dingosdk::logging::Level::warning, dingosdk::logging::Channel::customization,
+                "Outfit slots: template slot {} ({}) {}; outfits load without checking it.", index,
+                name.empty() ? std::string("unnamed") : name, what);
+    };
     for (std::uint32_t i = 0; i < count; ++i) {
         std::uintptr_t slot{}, type{}, name{}, category{}, category_name{};
         std::uint32_t hash{}, category_hash{}; std::string text, category_text;
         if (!read(slots + i * 24ULL + 8, slot)) return false;
         slot &= ~std::uintptr_t{4};
-        if (!read(slot + 8, type) || type != local_runtime().base + addr::engine::cosmetic_slot_type ||
-            !read(slot + 0x20, name) || !cosmetic_text(name, text) || text.empty() ||
-            !read(slot + 0x4c, hash) || hash != cosmetic_hash(text) ||
-            !read(slot + 0x30, category)) return false;
+        if (!read(slot + 8, type) || type != local_runtime().base + addr::engine::cosmetic_slot_type) {
+            skip(i, {}, "is not a loaded slot asset"); continue;
+        }
+        if (!read(slot + 0x20, name) || !cosmetic_text(name, text) || text.empty()) { skip(i, {}, "has no readable name"); continue; }
+        if (!read(slot + 0x4c, hash) || hash != cosmetic_hash(text)) { skip(i, text, "has a hash that is not its name's"); continue; }
+        if (!read(slot + 0x30, category)) { skip(i, text, "has no readable category"); result.emplace(hash, any_slot_category); continue; }
         category &= ~std::uintptr_t{4};
-        if (!read(category + 0x28, category_name) || !cosmetic_text(category_name, category_text) || category_text.empty() ||
-            !read(category + 0x38, category_hash) || category_hash != cosmetic_hash(category_text) ||
-            !result.emplace(hash, category_hash).second) return false;
+        if (!category || !read(category + 0x28, category_name) || !cosmetic_text(category_name, category_text) ||
+            category_text.empty() || !read(category + 0x38, category_hash) || category_hash != cosmetic_hash(category_text)) {
+            skip(i, text, "has a category that cannot be read (it takes any item)");
+            result.emplace(hash, any_slot_category);
+            continue;
+        }
+        if (!result.emplace(hash, category_hash).second) skip(i, text, "repeats a slot listed before it");
     }
     return true;
 }
@@ -374,6 +411,40 @@ bool load_cosmetic_hook(const void* wrapper, void* destination) {
             // keeps it for when the slot is back.
             std::map<std::uint32_t, const profile::CosmeticSlot*> saved_slots;
             for (const auto& item : recipe.items) saved_slots.emplace(item.slot, &item);
+            // A mod that moves its items to a slot of their own (Physical Lanyards' Accessories): an item saved
+            // in a slot it no longer fits goes to the template's slot it does fit, when the outfit has nothing
+            // there, so outfits saved before keep wearing it (and the next save keeps it there).
+            {
+                std::vector<std::pair<std::uint32_t, std::uint32_t>> moves;   // from, to
+                std::set<std::uint32_t> taken;
+                for (const auto& [hash, item] : saved_slots) {
+                    if (item->asset.empty()) continue;
+                    const auto found = c.items.find(item->asset);
+                    if (found == c.items.end()) continue;
+                    const auto& categories = found->second.categories;
+                    const auto fits = [&](std::uint32_t slot) {
+                        const auto category = slot_categories.find(slot);
+                        return category != slot_categories.end() && (category->second == any_slot_category ||
+                               std::find(categories.begin(), categories.end(), category->second) != categories.end());
+                    };
+                    if (fits(hash)) continue;
+                    for (const auto& [slot, category] : slot_categories) {
+                        if (slot == hash || taken.contains(slot) || !fits(slot)) continue;
+                        const auto there = saved_slots.find(slot);
+                        if (there != saved_slots.end() && !there->second->asset.empty()) continue;
+                        moves.emplace_back(hash, slot);
+                        taken.insert(slot);
+                        break;
+                    }
+                }
+                for (const auto& [from, to] : moves) {
+                    const auto* item = saved_slots.at(from);
+                    saved_slots.erase(from);
+                    saved_slots[to] = item;
+                    dingosdk::logging::log(dingosdk::logging::Level::info, dingosdk::logging::Channel::customization,
+                        "Saved outfit \"{}\": item {} moved from slot {} to slot {}, the one it fits now.", id, item->asset, from, to);
+                }
+            }
             std::size_t added{};
             item_arrays.emplace_back(expected.items.size());
             for (std::size_t j = 0; j < expected.items.size(); ++j) {
@@ -387,11 +458,11 @@ bool load_cosmetic_hook(const void* wrapper, void* destination) {
                     // default. Rejecting the whole outfit would also block every
                     // later save to this preset, so outfits could never be fixed.
                     const auto found = c.items.find(slot->asset);
-                    const auto category = slot_categories.find(slot->slot);
+                    const auto category = slot_categories.find(expected.items[j].slot);
                     const char* problem = found == c.items.end() ? "is no longer installed" :
-                        category == slot_categories.end() ||
+                        category == slot_categories.end() || (category->second != any_slot_category &&
                         std::find(found->second.categories.begin(), found->second.categories.end(), category->second) ==
-                            found->second.categories.end() ? "no longer fits its slot" : nullptr;
+                            found->second.categories.end()) ? "no longer fits its slot" : nullptr;
                     if (problem) {
                         dingosdk::logging::log(dingosdk::logging::Level::warning, dingosdk::logging::Channel::customization,
                             "Saved outfit \"{}\": item {} {}; showing the default for that slot and keeping the item "

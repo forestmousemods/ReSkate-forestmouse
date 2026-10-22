@@ -475,22 +475,34 @@ void set_nametag_feed(NametagFeed) noexcept;
 // The skater item grids' favorites, search and filter (item_browser_overlay.cpp): what the host's
 // grids show now, and what the keys ask of them. The view is read while a grid is open; every
 // function is thread-safe and only queues work for the client thread.
+struct ItemBrowserTab {
+    std::string name;           // "All", "Hoodies", ...
+    unsigned shown{}, total{};  // its items the search and the filter leave, and all of them
+};
 struct ItemBrowserView {
     bool open{};                // an item grid has the focus
     std::string search, filter; // the search text and the filter's name
     unsigned shown{}, total{};  // tiles in the grid that has the focus
     bool focused_favorite{};    // the highlighted item is a favorite
+    std::string focused_key;    // the highlighted item's key (the keychain panel, accessory_probe.h)
+    int focused_index{-1};      // its tile's place in the grid as shown, and the tiles shown (the panel's nudge)
+    std::string focused_shows;  // the item its tile shows now (an accessory tile: the place picked)
+    unsigned rows{};
     // The mod the highlighted item is from (empty title: the game's own), for its card: its icon
     // file (UTF-8), how many items it has, and whether it only changes one of the game's.
     std::string mod_title, mod_author, mod_version, mod_icon;
     unsigned mod_items{};
     bool mod_changed{};
+    std::vector<ItemBrowserTab> tabs; // the grid's type tabs; empty when it has one kind of item or none
+    unsigned tab{};             // the one picked
 };
 struct ItemBrowserHost {
     ItemBrowserView (*view)(){};
     void (*toggle_favorite)(){};
     void (*set_search)(const char *text){};
     void (*cycle_filter)(){};
+    void (*step_tab)(int steps){}; // right, or left when negative
+    void (*pick_tab)(unsigned tab){};
 };
 // `host` must stay valid for the life of the process.
 void set_item_browser(const ItemBrowserHost *host) noexcept;

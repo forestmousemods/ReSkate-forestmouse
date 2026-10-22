@@ -52,5 +52,8 @@ std::filesystem::path steam_avatar_path();
 // splash can open before this returns). Throws a user-facing message.
 DWORD start_game(const Session& session, const launcher::LaunchOptions& options,
                  const std::function<void(DWORD)>& created = {});
+// Our fork: waits up to 20 s for a Skate.exe of this folder that is still running (the last session closing) to go;
+// throws a user-facing message when it does not (a second game beside it hangs on its loading screen).
+void wait_for_earlier_game(const Session& session);
 
 } // namespace dingosdk::launcher_app

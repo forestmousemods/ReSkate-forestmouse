@@ -741,7 +741,7 @@ void render(IDXGISwapChain* presented, UINT flags) {
     const bool nametag_frame = nametags_pending();
     const bool meat_frame = hall_of_meat_pending();
     const bool item_browser_frame = item_browser_pending();
-    const bool perf_frame = perf_hud_pending() || trainer_hud_pending();
+    const bool perf_frame = perf_hud_pending() || trainer_hud_pending() || access_lock_pending();
     const bool hub_frame = hub_page_pending();
     if (trainer_open_requested()) s.visible.store(true);
     if (dingosdk::drone::menu_flag().load()) s.visible.store(true); // `dronemenu`: the menu opens on its DRONE page
@@ -824,6 +824,7 @@ void render(IDXGISwapChain* presented, UINT flags) {
     draw_item_browser();
     draw_chat();
     draw_map_download();
+    draw_access_lock();
     sync_menu_cursor(); // close buttons also change visibility, without a key message
     ImGui::Render();
     if (ImGui::GetDrawData()->TotalVtxCount == 0) { ImGui::SetCurrentContext(previous); return; }

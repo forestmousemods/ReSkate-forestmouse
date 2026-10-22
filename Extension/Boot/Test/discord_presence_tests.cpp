@@ -82,6 +82,13 @@ int main() {
                               R"({"cmd":"DISPATCH","evt":"ACTIVITY_JOIN","data":{"user":{"id":"53908232506183680"}}})",
                               R"({"cmd":"DISPATCH","evt":"ACTIVITY_JOIN_REQUEST","data":{}})"})
         check(join_asker(wrong).empty(), wrong);
+    // fit60: the app's own account, from READY only.
+    const auto who = ready_account(R"({"cmd":"DISPATCH","evt":"READY","data":{"v":1,"user":{"id":"53908232506183680","username":"mason01","global_name":"Mason"}}})");
+    check(who.id == "53908232506183680" && who.username == "mason01", "The account in READY was not read");
+    for (const auto *wrong : {R"({"cmd":"DISPATCH","evt":"READY","data":{"user":{"id":53908232506183680,"username":"mason01"}}})",
+                              R"({"cmd":"DISPATCH","evt":"ACTIVITY_JOIN_REQUEST","data":{"user":{"id":"53908232506183680","username":"mason01"}}})",
+                              R"({"cmd":"DISPATCH","evt":"READY","data":{}})", "not json"})
+        check(ready_account(wrong).id.empty(), wrong);
     if (!failures) std::cout << "discord presence tests passed\n";
     return failures ? 1 : 0;
 }

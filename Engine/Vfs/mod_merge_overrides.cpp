@@ -1,4 +1,5 @@
 #include "mod_merge_internal.h"
+#include "lua_script_merge.h"
 #include "Engine/Resource/cas_codec.h"
 #include "Engine/Resource/ebx_document.h"
 #include "Engine/Resource/ebx_merge.h"
@@ -11,6 +12,7 @@
 #include <atomic>
 #include <cstring>
 #include <exception>
+#include <iterator>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -28,12 +30,12 @@ struct GameBundle {
     // The game's copy of each asset: its sha1, and where in the listing it is.
     std::map<std::string, std::pair<fb::Sha1, std::size_t>, std::less<>> original;
     std::map<std::string, const fb::BundleAsset*, std::less<>> scripts;
-    std::set<std::string, std::less<>> resources;
+    std::map<std::string, fb::Sha1, std::less<>> resources;   // by lower-case name: the game's sha1
 };
 struct GameToc {
     fb::TocDocument document;
     std::map<std::string, const fb::TocBundle*, std::less<>> bundles;
-    std::set<fb::Guid> chunks;
+    std::map<fb::Guid, fb::TocChunk> chunks;
 };
 // Made on first use by whichever thread asks first; the others wait for it. One that could
 // not be read throws for each asker, as reading it for each did.
@@ -76,6 +78,9 @@ struct Script {
     fb::Sha1 game;      // the game's copy it replaces
     std::optional<AssetOverride> value;   // none: it could not be read, and `note` says so
     std::size_t note{};                   // its place in the mod's notes
+    // The game's copy, as stored: what two mods' versions are combined against (none: it could not be read, and
+    // a version is then taken whole, the highest mod's).
+    std::optional<std::vector<std::byte>> base;
 };
 // What one mod's files say, read without regard to any other mod: the part of the work that
 // is reading and decoding, done for several mods at once. What it means beside the mods
@@ -89,6 +94,11 @@ struct ModRead {
     std::vector<bool> unreadable;                                    // per candidate: never follows
     std::map<std::string, std::set<fb::Guid>, std::less<>> addedIn;  // the documents it added to each bundle, by guid
     std::vector<fb::TocChunk> newChunks;   // TOC chunks the game's TOCs do not have
+    // TOC chunks the game's TOCs have that the mod's point elsewhere: the game's entry, then the mod's
+    std::vector<std::pair<fb::TocChunk, fb::TocChunk>> replacedChunks;
+    // The game's resources (not scripts) the mod changes, decoded: a replaced chunk one of them names (a texture with
+    // a new size or format) is not swapped in where the game's resource still stands.
+    std::vector<std::vector<std::byte>> changedResources;
     std::set<fb::Guid> imported;
     std::vector<Change> changes;
     std::vector<Script> scripts;
@@ -99,7 +109,8 @@ struct ModRead {
 ModRead read_mod(const Mod& mod, const RelativeFiles& files, const CasStore& store, const fs::path& baseRoot,
                  const fs::path& gameRoot, Shared<GameToc>& gameTocs, Shared<GameBundle>& gameBundles) {
     ModRead read;
-    auto& [candidates, companions, unreadable, addedIn, newChunks, imported, changes, scripts, notes, failure] = read;
+    auto& [candidates, companions, unreadable, addedIn, newChunks, replacedChunks, changedResources, imported, changes,
+           scripts, notes, failure] = read;
     const auto decoded = [&](std::span<const std::byte> encoded) {
         return fb::ebx::read_document(fb::decode_cas(encoded, {gameRoot}));
     };
@@ -113,10 +124,14 @@ ModRead read_mod(const Mod& mod, const RelativeFiles& files, const CasStore& sto
             const auto& game = gameTocs.get(tocKey, [&](GameToc& toc) {
                 toc.document = fb::read_toc(read_file(baseToc));
                 for (const auto& bundle : toc.document.bundles) toc.bundles.emplace(lower(bundle.name), &bundle);
-                for (const auto& chunk : toc.document.chunks) toc.chunks.insert(chunk.guid);
+                for (const auto& chunk : toc.document.chunks) toc.chunks.emplace(chunk.guid, chunk);
             });
-            for (const auto& chunk : own.chunks)
-                if (!chunk.removed && chunk.location.patch && !game.chunks.contains(chunk.guid)) newChunks.push_back(chunk);
+            for (const auto& chunk : own.chunks) {
+                if (chunk.removed || !chunk.location.patch) continue;
+                const auto shipped = game.chunks.find(chunk.guid);
+                if (shipped == game.chunks.end()) newChunks.push_back(chunk);
+                else if (!shipped->second.removed) replacedChunks.emplace_back(shipped->second, chunk);
+            }
             for (const auto& bundle : own.bundles) {
                 const auto bundleName = lower(bundle.name);
                 const auto shipped = game.bundles.find(bundleName);
@@ -133,7 +148,7 @@ ModRead read_mod(const Mod& mod, const RelativeFiles& files, const CasStore& sto
                     // Other resource types retain their own table/dependency merge rules.
                     for (const auto& asset : manifest.resources) {
                         if (asset.resourceType == luaScriptResourceType) made.scripts.emplace(lower(asset.name), &asset);
-                        made.resources.insert(lower(asset.name));
+                        made.resources.emplace(lower(asset.name), asset.sha1);
                     }
                 });
                 if (!modListing || !known.listing) continue;
@@ -187,11 +202,23 @@ ModRead read_mod(const Mod& mod, const RelativeFiles& files, const CasStore& sto
                     const auto at = modListing->first + modListing->manifest.ebx.size() + index;
                     if (at >= modListing->files.size()) continue;
                     const auto& file = modListing->files[at];
+                    // The game's copy, for combining this mod's version with another mod's (one script, such
+                    // as the skater's loader, that several mods change for different things).
+                    std::optional<std::vector<std::byte>> base;
+                    try {
+                        const auto& gameResources = gameListing->manifest.resources;
+                        const auto gameIndex = static_cast<std::size_t>(originalScript->second - gameResources.data());
+                        const auto gameAt = gameListing->first + gameListing->manifest.ebx.size() + gameIndex;
+                        if (gameIndex < gameResources.size() && gameAt < gameListing->files.size()) {
+                            const auto& gameFile = gameListing->files[gameAt];
+                            base = store.read(baseRoot, gameFile.location, gameFile.offset, gameFile.size);
+                        }
+                    } catch (const std::exception&) { base.reset(); }
                     try {
                         scripts.push_back({name, originalScript->second->sha1,
                             AssetOverride{mod.name, asset.sha1, asset.originalSize,
                                 store.read(file.location.patch ? mod.directory : baseRoot,
-                                           file.location, file.offset, file.size), asset}});
+                                           file.location, file.offset, file.size), asset}, 0, std::move(base)});
                     } catch (const std::exception& failed) {
                         // Read whether or not it will be wanted, so a failure is only this
                         // script's: where a higher mod's version stands, it is nobody's and
@@ -200,6 +227,21 @@ ModRead read_mod(const Mod& mod, const RelativeFiles& files, const CasStore& sto
                             ": its changes could not be read for other mods' copies (" + failed.what() + ")");
                         scripts.push_back({name, originalScript->second->sha1, std::nullopt, notes.size() - 1});
                     }
+                }
+                // The game's resources the mod changes (not scripts): what its replaced chunks are checked against.
+                for (std::size_t index = 0; index < modListing->manifest.resources.size(); ++index) {
+                    const auto& asset = modListing->manifest.resources[index];
+                    if (asset.resourceType == luaScriptResourceType) continue;
+                    const auto game_copy = known.resources.find(lower(asset.name));
+                    const auto at = modListing->first + modListing->manifest.ebx.size() + index;
+                    if (game_copy == known.resources.end() || game_copy->second == asset.sha1 ||
+                        at >= modListing->files.size()) continue;
+                    const auto& file = modListing->files[at];
+                    try {
+                        changedResources.push_back(fb::decode_cas(
+                            store.read(file.location.patch ? mod.directory : baseRoot, file.location, file.offset, file.size),
+                            {gameRoot}));
+                    } catch (const std::exception&) {}
                 }
                 // Resources the mod adds, kept to go with an added EBX of the same name
                 // (a wave's sound-bank resource registers the wave with the audio system).
@@ -282,13 +324,56 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
     const auto decoded = [&](std::span<const std::byte> encoded) {
         return fb::ebx::read_document(fb::decode_cas(encoded, {gameRoot}));
     };
+    // Mods' edits as op lists (mod_merge_ops.cpp), and every mod's version of an asset one of them has ops for.
+    std::vector<AssetOps> assetOps;
+    for (const auto& [mod, files] : asked) {
+        auto mine = read_asset_ops(*mod, report);
+        assetOps.insert(assetOps.end(), std::make_move_iterator(mine.begin()), std::make_move_iterator(mine.end()));
+    }
+    std::set<std::string, std::less<>> opsAssets;
+    for (const auto& entry : assetOps) opsAssets.insert(entry.name);
+    std::vector<OpsVersion> opsVersions;
+    // What the CAS slot settling needs (reconcile_cas_slots): every mod's versions of the slot template, the skater
+    // recipes and the loader prefab, the game's copies of them, and the game's copies of the scripts mods change.
+    std::vector<CasSlotVersion> casVersions;
+    std::map<std::pair<std::string, fb::Sha1>, std::vector<std::byte>> casGame;
+    std::map<std::string, std::vector<std::byte>, std::less<>> gameScripts;
+    const auto casAsset = [](const std::string& name) {
+        return name == "gameplay/characters/data/recipetemplate/casrecipetemplate" ||
+               name == "characters/maincharacters/generic/cas/common/loaders/cas_rsp_lualoader_prefab" ||
+               name.starts_with("gameplay/characters/data/recipe/");
+    };
+    // Replaced chunks a higher mod keeps to itself (it changes their resources too): no lower mod's goes elsewhere.
+    std::set<fb::Guid> chunksKept;
     // Settle: highest priority first, an asset a higher mod already changed keeps that change.
     for (std::size_t slot = 0; slot < asked.size(); ++slot) {
         const auto* mod = asked[slot].first;
         auto& read = reads[slot];
         if (read.failure) std::rethrow_exception(read.failure);
-        auto& [candidates, companions, unreadable, addedIn, newChunks, imported, changes, scripts, notes, failure] = read;
+        auto& [candidates, companions, unreadable, addedIn, newChunks, replacedChunks, changedResources, imported, changes,
+               scripts, notes, failure] = read;
         std::size_t changed{};
+        // The game's chunks this mod replaces, unless a higher mod replaces them (the same chunk in several of the
+        // mod's TOCs: the first) or a resource the mod changes names it.
+        std::size_t replacing{}, withResource{};
+        for (const auto& [game, chunk] : replacedChunks) {
+            if (out.replacedChunks.contains(chunk.guid) || chunksKept.contains(chunk.guid)) continue;
+            const auto named = std::ranges::any_of(changedResources, [&](const std::vector<std::byte>& bytes) {
+                return !std::ranges::search(bytes, chunk.guid.bytes).empty(); });
+            if (named) {
+                chunksKept.insert(chunk.guid);
+                ++withResource;
+                continue;
+            }
+            out.replacedChunks.emplace(chunk.guid, AssetOverrides::ReplacedChunk{mod->name, game, chunk});
+            ++replacing;
+        }
+        if (replacing)
+            report.notes.push_back(mod->name + ": " + std::to_string(replacing) +
+                " replaced chunk(s) also apply where other mods' superbundles list the game's");
+        if (withResource)
+            report.notes.push_back(mod->name + ": " + std::to_string(withResource) +
+                " replaced chunk(s) stay its own: it changes their resources too");
         // A higher mod's version of an asset, which this mod's change is combined with
         // below, may name what this mod adds.
         for (const auto& change : changes)
@@ -297,10 +382,52 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
                     for (const auto& reference : decoded(existing->second.encoded).imports)
                         imported.insert(reference.fileGuid);
                 } catch (const std::exception&) {}
+        for (const auto& script : scripts)
+            if (script.base && !gameScripts.contains(script.name)) gameScripts.emplace(script.name, *script.base);
+        for (const auto& change : changes) {
+            if (!casAsset(change.name)) continue;
+            casVersions.push_back({mod->name, change.name, change.game, change.encoded});
+            if (change.gameFile && !casGame.contains({change.name, change.game})) try {
+                casGame.emplace(std::pair{change.name, change.game},
+                                store.read(baseRoot, change.gameFile->location, change.gameFile->offset, change.gameFile->size));
+            } catch (const std::exception&) {}
+        }
         for (auto& script : scripts) {
             auto& versions = out.scripts[script.name];
-            if (versions.contains(script.game)) {
+            if (const auto higher = versions.find(script.game); higher != versions.end()) {
                 if (!script.value) notes[script.note].clear();   // not wanted: as if never read
+                // Another mod above changed this script as well. Where the two changed different lines (Studio's
+                // costume material targets in the skater's loader, a mod's own slot in it), both changes are
+                // combined against the game's copy; lines both changed differently leave the higher mod's whole.
+                else if (script.base && script.value->sha1 != higher->second.sha1 && script.value->resource &&
+                         higher->second.resource) {
+                    std::string outcome;
+                    try {
+                        const auto game = fb::decode_cas(*script.base, {gameRoot});
+                        const auto above = fb::decode_cas(higher->second.encoded, {gameRoot});
+                        const auto mine = fb::decode_cas(script.value->encoded, {gameRoot});
+                        if (const auto merged = merge_lua_script(game, above, mine)) {
+                            auto& kept = higher->second;
+                            kept.sha1 = sha1_of(*merged);
+                            kept.originalSize = merged->size();
+                            kept.encoded = fb::encode_cas(*merged, {gameRoot});
+                            const auto meta = lua_script_meta(*merged);
+                            kept.resource->resourceMeta.assign(meta.begin(), meta.end());
+                            kept.resource->originalSize = merged->size();
+                            kept.resource->sha1 = kept.sha1;
+                            outcome = script.name + ": " + kept.mod + "'s and " + mod->name +
+                                "'s changes to this Lua script combined (they change different lines)";
+                            kept.mod += " + " + mod->name;
+                        } else {
+                            outcome = script.name + ": " + mod->name + "'s change to this Lua script is left out: " +
+                                higher->second.mod + " changes the same lines differently, and its version is kept";
+                        }
+                    } catch (const std::exception& failed) {
+                        outcome = script.name + ": " + mod->name + "'s change to this Lua script could not be combined with " +
+                            higher->second.mod + "'s (" + failed.what() + "); " + higher->second.mod + "'s is kept";
+                    }
+                    report.notes.push_back(std::move(outcome));
+                }
                 continue;
             }
             if (!script.value) continue;   // wanted, and noted
@@ -380,6 +507,9 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
                         if (beside->second.contains(reference.fileGuid) && stays(reference))
                             names.insert(reference.fileGuid);
             } catch (const std::exception&) {}
+            if (opsAssets.contains(change.name) && std::ranges::none_of(opsVersions, [&](const OpsVersion& have) {
+                    return have.mod == mod->name && have.name == change.name && have.game == change.game; }))
+                opsVersions.push_back({mod->name, change.name, change.game, change.encoded, names});
             auto& versions = out.changed[change.name];
             const auto existing = versions.find(change.game);
             if (existing == versions.end()) {
@@ -454,6 +584,16 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
         if (changed)
             report.notes.push_back(mod->name + ": " + std::to_string(changed) +
                 " changed asset(s) also apply to the copies other mods carry");
+    }
+    try {
+        reconcile_cas_slots(out, casVersions, casGame, gameScripts, gameRoot, report);
+    } catch (const std::exception& failed) {
+        report.notes.push_back(std::string("skater slots of several mods could not be settled (") + failed.what() + ")");
+    }
+    try {
+        replay_asset_ops(out, assetOps, opsVersions, gameRoot, report);
+    } catch (const std::exception& failed) {
+        report.notes.push_back(std::string("mods' reskate-ops could not be made (") + failed.what() + ")");
     }
     return out;
 }

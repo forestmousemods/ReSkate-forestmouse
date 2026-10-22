@@ -13,6 +13,7 @@
 
 #include <Windows.h>
 #include <Psapi.h>
+#include <TlHelp32.h>
 #include <ShlObj.h>
 #include <shellapi.h>
 #include <winternl.h>
@@ -461,6 +462,47 @@ RemoteModule inject_dll(HANDLE process, const fs::path& dll) {
     return module;
 }
 
+// The Skate.exe processes of this folder now running.
+std::vector<DWORD> running_games(const fs::path& game) {
+    std::vector<DWORD> ids;
+    Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (!snapshot) return ids;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    for (auto more = Process32FirstW(snapshot.get(), &entry); more; more = Process32NextW(snapshot.get(), &entry)) {
+        if (_wcsicmp(entry.szExeFile, L"Skate.exe") != 0) continue;
+        Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID));
+        if (!process) continue;
+        std::vector<wchar_t> path(32768);
+        DWORD length = static_cast<DWORD>(path.size());
+        if (QueryFullProcessImageNameW(process.get(), 0, path.data(), &length) &&
+            same_file(game, fs::path(std::wstring(path.data(), length))))
+            ids.push_back(entry.th32ProcessID);
+    }
+    return ids;
+}
+
+// Our fork (2026-10-21): a Skate.exe of this folder still open - the last session closing slowly or stuck on its way
+// out, or started from another launcher window - holds the save, and a second one started beside it never gets past
+// its loading screen ("Save is already in use"; a friend's install hung on the first map that way). The earlier one is
+// given time to finish closing (the runtime ends a game 8 s after it was asked to close); one that is still there is
+// named, and nothing is started.
+void await_earlier_game(const fs::path& game) {
+    auto ids = running_games(game);
+    if (ids.empty()) return;
+    dingosdk::logging::log(dingosdk::logging::Level::warning, dingosdk::logging::Channel::launcher,
+        "Skate.exe of this folder is still running (process {}): waiting up to 20 s for it to close", ids.front());
+    for (int waited = 0; waited < 20000 && !ids.empty(); waited += 250) {
+        Sleep(250);
+        ids = running_games(game);
+    }
+    if (!ids.empty())
+        throw std::runtime_error(std::format("Skate is still running from an earlier start (process {}). Close it, or end "
+            "Skate.exe in Task Manager, then press Play again.", ids.front()));
+    dingosdk::logging::write(dingosdk::logging::Level::info, dingosdk::logging::Channel::launcher,
+                             "The earlier Skate.exe has closed; starting the game.");
+}
+
 } // namespace
 
 namespace dingosdk::launcher_app {
@@ -711,6 +753,10 @@ void ensure_minidump_apiset_shim(const fs::path& game_directory) noexcept {
     } catch (...) {}
 }
 
+void wait_for_earlier_game(const Session& session) {
+    await_earlier_game(canonical_file(session.paths.game, L"Skate.exe"));
+}
+
 DWORD start_game(const Session& session, const launcher::LaunchOptions& options,
                  const std::function<void(DWORD)>& created) {
     trace::Scope timing("launcher.start_game", "app.start");
@@ -726,6 +772,7 @@ DWORD start_game(const Session& session, const launcher::LaunchOptions& options,
         !fs::equivalent(paths.steam_api.parent_path(), paths.directory, path_error) || path_error)
         throw std::runtime_error(
             "Skate.exe, ReSkate.dll, and the original steam_api64.dll must be beside ReSkateLauncher.exe");
+    await_earlier_game(paths.game);
 
     // Satisfy Skate.exe's MiniDumpWriteDump API-set import under Wine/Proton.
     ensure_minidump_apiset_shim(paths.directory);
@@ -819,12 +866,20 @@ DWORD start_game(const Session& session, const launcher::LaunchOptions& options,
     set_environment(L"RESKATE_GPU_DIAGNOSTICS", options.gpu_diagnostics ? L"1" : L"0");
     // -map: the game loads it once it is up, as the console's "load" would (client_tick.cpp),
     // ahead of any startup commands already asked for.
+    // Our fork (2026-10-20): the commands the launcher was started with are read ONCE. Play pressed again in the same
+    // launcher put "load <map>" in front of the variable it had already set ("load california;load california"),
+    // and the game loaded the map again and again until a load stuck on "Starting server".
+    static const std::optional<std::wstring> started_with = [] {
+        std::wstring value(4096, L'\0');
+        const auto length = GetEnvironmentVariableW(L"RESKATE_STARTUP_COMMANDS", value.data(), 4096);
+        return length && length < 4096 ? std::optional<std::wstring>(value.substr(0, length)) : std::nullopt;
+    }();
     if (!options.map.empty()) {
         std::wstring commands = L"load " + options.map;
-        std::wstring already(4096, L'\0');
-        const auto length = GetEnvironmentVariableW(L"RESKATE_STARTUP_COMMANDS", already.data(), 4096);
-        if (length && length < 4096) commands += L";" + already.substr(0, length);
+        if (started_with && !started_with->empty()) commands += L";" + *started_with;
         set_environment(L"RESKATE_STARTUP_COMMANDS", commands.c_str());
+    } else {
+        set_environment(L"RESKATE_STARTUP_COMMANDS", started_with ? started_with->c_str() : nullptr);
     }
     set_environment(L"RESKATE_DISCORD", options.discord ? L"1" : L"0");
     if (options.menu_key == options.console_key)

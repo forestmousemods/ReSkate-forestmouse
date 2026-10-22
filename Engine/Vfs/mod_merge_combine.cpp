@@ -980,19 +980,67 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
                 // other mods' items pointing at presets the game cannot find.
                 const auto refTable = entry.asset.kind == fb::AssetKind::resource &&
                     fb::bundle_ref::is_table(entry.asset.name);
-                if (entry.asset.kind != fb::AssetKind::ebx && !shaderTable && !refTable) continue;
+                // A Lua script mods change (the skater loader): the version settled for all of them, in every copy.
+                // The highest-priority mod's own copy kept whole here left the others' changes out of the game's
+                // bundles (a costume mod's material-targets loader beside a mod's own slot), reaching maps only.
+                const auto luaScript = entry.asset.kind == fb::AssetKind::resource &&
+                    entry.asset.resourceType == luaScriptResourceType;
+                if (entry.asset.kind != fb::AssetKind::ebx && !shaderTable && !refTable && !luaScript) continue;
                 const auto found = state.history.find(asset_key(entry.asset));
                 if (found == state.history.end()) continue;
                 const Contribution* baseCopy{};
                 for (const auto& contribution : found->second)
                     if (contribution.base) { baseCopy = &contribution; break; }
                 if (!baseCopy) continue;
+                if (luaScript) {
+                    const auto versions = overrides.scripts.find(lower(entry.asset.name));
+                    if (versions == overrides.scripts.end()) continue;
+                    const auto kept = versions->second.find(baseCopy->sha1);
+                    if (kept == versions->second.end() || !kept->second.resource || entry.asset.sha1 == kept->second.sha1 ||
+                        kept->second.resource->resourceId != entry.asset.resourceId)
+                        continue;
+                    const auto placement = store.write(state.manifestChunk, manifestArchive, kept->second.encoded);
+                    entry.file = placement;
+                    entry.asset.sha1 = kept->second.sha1;
+                    entry.asset.originalSize = kept->second.originalSize;
+                    entry.asset.resourceMeta = kept->second.resource->resourceMeta;
+                    used.emplace(placement.location.installChunk, placement.location.archive);
+                    ++report.mergedAssets;
+                    continue;
+                }
+                // Settled once for every copy (mods that add skater slots, mod_merge_cas_slots.cpp): that version.
+                if (entry.asset.kind == fb::AssetKind::ebx)
+                    if (const auto versions = overrides.changed.find(lower(entry.asset.name)); versions != overrides.changed.end())
+                        if (const auto kept = versions->second.find(baseCopy->sha1);
+                            kept != versions->second.end() && kept->second.reconciled) {
+                            if (entry.asset.sha1 != kept->second.sha1) {
+                                const auto placement = store.write(state.manifestChunk, manifestArchive, kept->second.encoded);
+                                entry.file = placement;
+                                entry.asset.sha1 = kept->second.sha1;
+                                entry.asset.originalSize = kept->second.originalSize;
+                                used.emplace(placement.location.installChunk, placement.location.archive);
+                                ++report.mergedAssets;
+                            }
+                            continue;
+                        }
                 // Both mods rebuild the whole bundle, so only the assets whose
                 // content actually moved away from the base are contested.
                 std::vector<const Contribution*> edits;
                 for (const auto& contribution : found->second)
                     if (!contribution.base && contribution.sha1 != baseCopy->sha1)
                         edits.push_back(&contribution);
+                // The same edit in several copies (a map's level bundles, each copy rewritten with one mod's change)
+                // is one edit: combined once for each copy, every copy appended what it adds again (2026-10-19: a
+                // map's template held Skaterize's ten slots seven times). The last of each is kept (the highest mod).
+                {
+                    std::vector<const Contribution*> distinct;
+                    for (auto at = edits.rbegin(); at != edits.rend(); ++at)
+                        if (std::none_of(distinct.begin(), distinct.end(),
+                                         [&](const Contribution* kept) { return kept->sha1 == (*at)->sha1; }))
+                            distinct.push_back(*at);
+                    std::reverse(distinct.begin(), distinct.end());
+                    edits = std::move(distinct);
+                }
                 // An item list is looked at even when one mod alone changed it:
                 // what its entries name has to be in the bundle either way.
                 const auto named = entry.asset.kind == fb::AssetKind::ebx && item_list_name(entry.asset.name);
@@ -1283,6 +1331,19 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
         }
         if (listed) report.notes.push_back(relative + ": " + std::to_string(listed) + " chunk(s) from " + name);
     }
+    // Our fork (2026-10-21): a chunk an asset mod replaces in the game's TOCs that this superbundle still lists as
+    // the game's entry (a map's level TOC copies the game's entries) takes the mod's data here too: the Accessories
+    // tab's icon stayed the game's earrings on custom maps. A map's own version of the chunk stays.
+    std::map<std::string, std::size_t, std::less<>> replacedBy;
+    for (auto& chunk : merged.chunks) {
+        const auto found = overrides.replacedChunks.find(chunk.guid);
+        if (found == overrides.replacedChunks.end() || !same(chunk, found->second.game)) continue;
+        chunk = found->second.chunk;
+        used.emplace(chunk.location.installChunk, chunk.location.archive);
+        ++replacedBy[found->second.mod];
+    }
+    for (const auto& [name, count] : replacedBy)
+        report.notes.push_back(relative + ": " + std::to_string(count) + " chunk(s) " + name + " replaces in the game's TOCs");
 
     if (sources.size() > 1) {
         report.notes.push_back(relative + ": combined " + std::to_string(sources.size()) +

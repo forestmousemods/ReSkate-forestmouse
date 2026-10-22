@@ -8,6 +8,9 @@ struct CosmeticItemInfo {
     std::string category;
     std::int32_t sort_priority{};
     bool build_kit{};
+    // What it is fitted on: its data's first morph preset or mesh ("Gen_Shirt_HoodieRelaxed_complex_dmPreset"),
+    // empty when unread. The item grids' type tabs sort mods' items by it.
+    std::string shape;
 };
 
 struct CosmeticRuntime {
@@ -95,6 +98,8 @@ template<class T> struct CosmeticBorrowedArray {
     T* data() { return reinterpret_cast<T*>(reinterpret_cast<std::byte*>(storage.data()) + 8); }
 };
 
+// A template slot whose category could not be read (fit22): any item fits it.
+inline constexpr std::uint32_t any_slot_category = 0xFFFFFFFFU;
 bool cosmetic_slot_categories(std::uintptr_t resource, std::map<std::uint32_t, std::uint32_t>& result);
 
 struct StarterTemplate {

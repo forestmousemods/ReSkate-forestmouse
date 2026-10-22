@@ -32,6 +32,7 @@ Presence wanted;            // under mutex
 long long wanted_since{};   // Unix seconds: when what the player is doing last changed kind
 std::atomic<bool> started{}, on{true};
 std::string join_wanted;    // under mutex: take_join
+Account seen_account;       // under mutex: account (fit60)
 
 // A join code is "<SteamID64>-<16 hex digits>" (protocol.h: format_invite). Discord hands back
 // whatever a status carried, which need not be one of ours.
@@ -157,6 +158,10 @@ void run() noexcept {
                     }
                 } else if (*opcode == 1 && json.find("\"READY\"") != std::string::npos) {
                     ready = true;
+                    if (auto who = ready_account(json); !who.id.empty()) {
+                        std::lock_guard lock(mutex);
+                        seen_account = std::move(who);
+                    }
                     // Discord then tells this game when its player asks to join someone.
                     pipe.send(1, "{\"cmd\":\"SUBSCRIBE\",\"evt\":\"ACTIVITY_JOIN\",\"nonce\":\"" + std::to_string(++nonce) + "\"}");
                     // And when someone asks to join this player.
@@ -265,6 +270,31 @@ std::string join_asker(std::string_view json) {
         auto id = message.at("data").at("user").value("id", "");
         const bool digits = !id.empty() && id.size() <= 20 && id.find_first_not_of("0123456789") == std::string::npos;
         return digits ? id : std::string();
+    } catch (...) {
+        return {};
+    }
+}
+
+Account ready_account(std::string_view json) {
+    try {
+        const auto message = Json::parse(json);
+        if (!message.is_object() || message.value("cmd", "") != "DISPATCH" || message.value("evt", "") != "READY" ||
+            !message.contains("data") || !message.at("data").is_object() || !message.at("data").contains("user") ||
+            !message.at("data").at("user").is_object())
+            return {};
+        const auto& user = message.at("data").at("user");
+        Account who{user.value("id", ""), user.value("username", "")};
+        const bool digits = !who.id.empty() && who.id.size() <= 20 && who.id.find_first_not_of("0123456789") == std::string::npos;
+        return digits && who.username.size() <= 64 ? who : Account{};
+    } catch (...) {
+        return {};
+    }
+}
+
+Account account() noexcept {
+    try {
+        std::lock_guard lock(mutex);
+        return seen_account;
     } catch (...) {
         return {};
     }

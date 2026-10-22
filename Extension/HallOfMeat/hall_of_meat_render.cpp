@@ -29,6 +29,9 @@ constexpr float camera_reach = 10.0f;    // metres from the client's camera: the
 struct State {
     std::atomic<bool> ready{}; // the hooks prepared
     bool hooked{};             // and enabled (hook_render): client thread only
+    unsigned owners{};         // who wants them on: 1 Hall of Meat, 2 the accessories (client thread)
+    std::atomic<PacketEditor> editor{};
+    std::atomic<ViewEditor> view_editor{};
     std::uintptr_t base{};
     DrawPacket draw_original{};
     RenderView view_original{};
@@ -118,6 +121,7 @@ void draw_packet_hook(std::uintptr_t object, std::uintptr_t packet) {
     try {
         observe_packet(object, packet);
     } catch (...) { /* A lost picture is never worth the renderer. */ }
+    if (const auto editor = s.editor.load(std::memory_order_acquire)) editor(object, packet);
 }
 
 // The camera of the main picture: a sound world matrix, close to the client's own camera.
@@ -158,9 +162,43 @@ void observe_view(std::uintptr_t view) {
     s.vertical_fov = fov;
     s.camera_at = GetTickCount64();
 }
+// What a view editor may change: the camera rows (+0x40, 48 bytes) and the vertical field of view (+0x104).
+struct ViewCamera {
+    float rows[12]{};
+    float fov{};
+};
+bool read_camera(std::uintptr_t view, ViewCamera& out) noexcept {
+    if (!view) return false;
+    std::memcpy(out.rows, reinterpret_cast<const void*>(view + 0x40), sizeof(out.rows));
+    std::memcpy(&out.fov, reinterpret_cast<const void*>(view + 0x104), sizeof(out.fov));
+    return true;
+}
+bool same_camera(const ViewCamera& a, const ViewCamera& b) noexcept {
+    return std::memcmp(a.rows, b.rows, sizeof(a.rows)) == 0 && std::memcmp(&a.fov, &b.fov, sizeof(a.fov)) == 0;
+}
+void write_camera(std::uintptr_t view, const ViewCamera& camera) noexcept {
+    std::memcpy(reinterpret_cast<void*>(view + 0x40), camera.rows, sizeof(camera.rows));
+    std::memcpy(reinterpret_cast<void*>(view + 0x104), &camera.fov, sizeof(camera.fov));
+}
 void render_view_hook(std::uintptr_t blackboard, std::uintptr_t current, std::uintptr_t previous, std::uint8_t jitter) {
     auto& s = state();
+    // The game's cameras before the editor, and what it made of them: put back after the draw where the view
+    // still holds the edit (a value the draw itself wrote is left).
+    ViewCamera game_current, game_previous, edit_current, edit_previous;
+    bool edited_current = false, edited_previous = false;
+    if (const auto editor = s.view_editor.load(std::memory_order_acquire)) {
+        LastError error;
+        const bool has_current = read_camera(current, game_current), has_previous = read_camera(previous, game_previous);
+        editor(current, previous);
+        edited_current = has_current && read_camera(current, edit_current) && !same_camera(edit_current, game_current);
+        edited_previous = has_previous && read_camera(previous, edit_previous) && !same_camera(edit_previous, game_previous);
+    }
     s.view_original(blackboard, current, previous, jitter);
+    {
+        ViewCamera now;
+        if (edited_current && read_camera(current, now) && same_camera(now, edit_current)) write_camera(current, game_current);
+        if (edited_previous && read_camera(previous, now) && same_camera(now, edit_previous)) write_camera(previous, game_previous);
+    }
     LastError error;
     try {
         observe_view(current);
@@ -211,7 +249,8 @@ bool start_render(std::uintptr_t base) noexcept {
     return false;
 }
 
-bool hook_render(bool on) noexcept {
+namespace {
+bool switch_hooks(bool on) noexcept {
     auto& s = state();
     if (!s.ready.load(std::memory_order_acquire)) return !on; // nothing to hook
     if (s.hooked == on) return true;
@@ -234,6 +273,24 @@ bool hook_render(bool on) noexcept {
         (void)(on ? hook_disable(target) : hook_enable(target));
     }
     return false;
+}
+bool hook_for(unsigned owner, bool on) noexcept {
+    auto& s = state();
+    const unsigned wanted = on ? s.owners | owner : s.owners & ~owner;
+    if (!switch_hooks(wanted != 0)) return false;
+    s.owners = wanted;
+    return true;
+}
+}
+
+bool hook_render(bool on) noexcept { return hook_for(1, on); }
+bool hook_render_for_accessories(bool on) noexcept { return hook_for(2, on); }
+void set_packet_editor(PacketEditor editor) noexcept { state().editor.store(editor, std::memory_order_release); }
+void set_view_editor(ViewEditor editor) noexcept { state().view_editor.store(editor, std::memory_order_release); }
+std::uint32_t skater_render_index(std::uintptr_t entity, std::size_t mode) noexcept {
+    auto& s = state();
+    if (!s.ready.load(std::memory_order_acquire) || !entity || mode >= build::render_modes) return no_index;
+    return render_index(s.base, entity, mode);
 }
 
 void follow_render(bool wanted) noexcept {

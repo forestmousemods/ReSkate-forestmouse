@@ -526,6 +526,9 @@ void Launcher::run_play() {
         if (!official_mods::wait(std::chrono::minutes(3)))
             logging::write(logging::Level::warning, logging::Channel::launcher, "Official mods were still being installed; Skate starts without them");
     }
+    // Our fork: the last Skate still closing holds the save and the merged mod files; a game started beside it hangs
+    // on its loading screen.
+    launcher_app::wait_for_earlier_game(session_);
     if (!ignore_mod_problems_ && !run_mod_merge()) return;
     ignore_mod_problems_ = false;
     set(Phase::launching, "Starting Skate");

@@ -43,6 +43,15 @@ std::string join_request(std::string_view json);
 // yes for the player at once, and Discord then lets them in as Join would.
 std::string join_asker(std::string_view json);
 
+// forestmouse fit60: the Discord account of the app this game talked to, from Discord's READY
+// (its user ID and username), or empty ones before that and without Discord. Any thread.
+struct Account {
+    std::string id, username;
+};
+Account account() noexcept;
+// The account in a READY message, or empty ones. Exposed for tests.
+Account ready_account(std::string_view json);
+
 // One message as Discord's pipe takes it: an opcode, a length and JSON. Exposed for tests.
 std::string frame(unsigned opcode, std::string_view json);
 // The command that shows `presence` (or, without one, clears it), since `started` (Unix seconds).

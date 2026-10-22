@@ -270,6 +270,9 @@ struct AssetOverride {
     // made the change in, by their guids. They go wherever the change goes: the
     // game keeps a list in more bundles than one, each with what the list names.
     std::set<fb::Guid> names;
+    // Settled once for every copy (mod_merge_cas_slots.cpp: mods that add skater slots): a bundle's copies take this
+    // version as it is, instead of being combined again there.
+    bool reconciled{};
 };
 inline constexpr std::uint32_t luaScriptResourceType = 0xEC383B87;
 // An EBX asset a mod added to one of the game's bundles, or a resource it added
@@ -304,8 +307,20 @@ struct AssetOverrides {
     // so wherever the additions go these entries go too. Collected pointing into
     // the mod's own archives; the merge shifts them to where those archives landed.
     std::map<std::string, std::vector<fb::TocChunk>, std::less<>> chunks;
+    // Our fork (2026-10-21): TOC chunks of the game's a mod replaces where its TOCs list them (Physical Lanyards'
+    // Accessories tab icon: the pixels of the game's head-accessories icon). A map's level TOC lists the game's
+    // entry for the same chunk and loads instead of the game's TOCs, so there the icon stayed the game's. By guid,
+    // the highest mod's; `chunk` is shifted like `chunks`.
+    struct ReplacedChunk {
+        std::string mod;
+        fb::TocChunk game;    // the game's entry: only an entry equal to it takes the mod's
+        fb::TocChunk chunk;   // the mod's
+    };
+    std::map<fb::Guid, ReplacedChunk> replacedChunks;
 
-    [[nodiscard]] bool empty() const noexcept { return changed.empty() && scripts.empty() && added.empty(); }
+    [[nodiscard]] bool empty() const noexcept {
+        return changed.empty() && scripts.empty() && added.empty() && replacedChunks.empty();
+    }
 };
 
 // The changes and additions asset mods (mods that add no levels) make to the
@@ -314,6 +329,39 @@ struct AssetOverrides {
 // to `threads` threads beside this one (`background`: at a priority under the game's, for a
 // merge while it runs); what they mean together is then settled in priority order, so the
 // result is the same whatever the count.
+// One mod's version of an asset the CAS slot settling looks at (the slot template, the skater recipes, the loader
+// prefab), highest priority first, and the game's copies of them (as stored).
+struct CasSlotVersion {
+    std::string mod;
+    std::string name;                   // lower case
+    fb::Sha1 game;                      // the game's copy it replaces
+    std::vector<std::byte> encoded;
+};
+void reconcile_cas_slots(AssetOverrides& out, const std::vector<CasSlotVersion>& versions,
+                         const std::map<std::pair<std::string, fb::Sha1>, std::vector<std::byte>>& gameCopies,
+                         const std::map<std::string, std::vector<std::byte>, std::less<>>& gameScripts,
+                         const fs::path& gameRoot, MergeReport& report);
+
+// Our fork (mod_merge_ops.cpp): a mod's edits to a game asset as an op list, Mods/<mod>/reskate-ops/<asset name with
+// "~" for "/">.json, made again on another mod's copy of the asset where both change it.
+struct AssetOps {
+    std::string mod;
+    std::string name;   // lower case
+    std::string json;
+};
+// One mod's version of an asset some mod has ops for, highest priority first.
+struct OpsVersion {
+    std::string mod;
+    std::string name;                   // lower case
+    fb::Sha1 game;                      // the game's copy it replaces
+    std::vector<std::byte> encoded;
+    std::set<fb::Guid> names;           // as AssetOverride::names
+};
+// Never throws for a mod's folder: what cannot be read is noted.
+std::vector<AssetOps> read_asset_ops(const Mod& mod, MergeReport& report);
+void replay_asset_ops(AssetOverrides& out, const std::vector<AssetOps>& ops, const std::vector<OpsVersion>& versions,
+                      const fs::path& gameRoot, MergeReport& report);
+
 AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
                                        const std::map<const Mod*, RelativeFiles>& modFiles,
                                        const CasStore& store, const fs::path& baseRoot,

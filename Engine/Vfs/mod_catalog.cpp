@@ -533,8 +533,13 @@ Catalog load_catalog(const std::filesystem::path& data_root, const MergeObserver
             // without it. Removing one mod cannot break another, but a few rounds
             // are allowed in case two damaged mods hid each other's problems.
             for (int round = 0;; ++round) {
-                // The first looks for conflicts before building anything (find_conflicts).
-                merge = merge_mods(result, observe, {.conflicts_first = round == 0});
+                // Our fork (2026-10-20): no check for conflicts before the merge and no mod left out WHOLE for one
+                // (2.1.1's rule): with a hundred clothing mods most share an asset or two, and our own merge rules
+                // (Skaterize + Physical_Lanyards: template, recipes, Lua, wardrobe UI ops) combine what the check
+                // would call a conflict. As in 2.1.0: of each asset the higher mod's version is in the game, and
+                // only a mod that cannot be merged cleanly is left out.
+                constexpr bool leave_out_conflicts = false;
+                merge = merge_mods(result, observe, {.conflicts_first = leave_out_conflicts && round == 0});
                 if (!merge.issue.empty() || round == 4) break; // a fifth merge only rebuilds without round four's removals
                 // (What the check before the merge noted, which the merge's own notes below would not carry.)
                 if (merge.stopped_for_conflicts)
@@ -563,7 +568,7 @@ Catalog load_catalog(const std::filesystem::path& data_root, const MergeObserver
                         leaving.insert(name);
                         continue;
                     }
-                    if (ours(name)) continue;
+                    if (ours(name) || !leave_out_conflicts) continue;
                     for (const auto& row : merge.conflicts) {
                         if (row.lost != name || leaving.contains(row.kept)) continue;
                         auto& entry = out[i];
